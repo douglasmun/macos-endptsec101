@@ -1,0 +1,25 @@
+# compiled binaries (each chapter builds a binary with no extension)
+01-hello-exec/hello-exec
+02-file-monitor/file-monitor
+03-auth-exec/auth-exec
+04-network/network
+05-muting/muting
+06-lsm-analog/lsm-analog
+07-ids/ids
+08-ancestry/ancestry
+09-tcc/tcc
+10-persistence/persistence
+11-codesign/codesign
+12-dynamic-policy/dynamic-policy
+13-auth-open/auth-open
+14-cs-invalidated/cs-invalidated
+15-deferred-auth/deferred-auth
+16-unified-agent/unified-agent
+
+# AI tool instruction files
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+
+# macOS
+.DS_Store
