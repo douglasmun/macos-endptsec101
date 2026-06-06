@@ -82,4 +82,4 @@ Documenting the gaps is as important as documenting what fires.
 - Combines with ch09 TCC state for the three-signal convergence rule.
 - Shares the alert/JSON output pattern from ch07.
 
-> Not yet implemented.
+> Implemented: `10-persistence/persistence.c`

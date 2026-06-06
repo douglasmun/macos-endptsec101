@@ -237,4 +237,4 @@ the goal every prior chapter was building toward.
 A production macOS EDR agent is, in essence, this chapter — with more rules,
 remote telemetry, and policy management. The ES API surface has been fully covered.
 
-> Not yet implemented.
+> Implemented: `16-unified-agent/unified-agent.c`

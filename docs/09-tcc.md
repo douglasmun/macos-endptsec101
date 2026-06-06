@@ -75,4 +75,4 @@ grant, revoke, or modify.
 - Shares the JSON alert output pattern from ch07.
 - The detection rules follow the same stateful pattern as ch07's rule engine.
 
-> Not yet implemented.
+> Implemented: `09-tcc/tcc.c`

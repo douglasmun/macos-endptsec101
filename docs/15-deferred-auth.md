@@ -162,4 +162,4 @@ independently. Ch15 is where they would be composed.
 - Uses ch08's process tree for ancestry context in the background worker.
 - Shares the JSON alert output pattern from ch07.
 
-> Not yet implemented.
+> Implemented: `15-deferred-auth/deferred-auth.c`

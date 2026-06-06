@@ -96,4 +96,4 @@ This chapter is primarily operational rather than detection-focused. The
 - The config file watch reuses the NOTIFY_WRITE subscription from ch02.
 - The AUTH_EXEC handler inherits from ch06 and ch11.
 
-> Not yet implemented.
+> Implemented: `12-dynamic-policy/dynamic-policy.c`

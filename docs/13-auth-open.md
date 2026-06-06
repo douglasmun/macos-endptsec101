@@ -101,4 +101,4 @@ every one of these event types.
 - Completes the event type coverage: every major ES event type has now appeared
   in at least one chapter.
 
-> Not yet implemented.
+> Implemented: `13-auth-open/auth-open.c`

@@ -493,9 +493,11 @@ static void evaluate_open_and_respond(auth_ctx_t *ctx)
         return;
     }
 
-    /* Read-only opens: allow */
+    /* Read-only opens: allow.
+     * AUTH_OPEN fflag carries kernel FREAD/FWRITE flags (not open(2) O_ flags).
+     * FWRITE=0x2; if not set, the open is read-only. */
     uint32_t fflag = msg->event.open.fflag;
-    if ((fflag & O_ACCMODE) == O_RDONLY) {
+    if (!(fflag & FWRITE)) {
         es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
         es_release_message(msg);
         return;
@@ -807,7 +809,7 @@ int main(void)
     init_timebase();
 
     g_main_queue = dispatch_get_main_queue();
-    g_work_queue = dispatch_queue_create("argus.unified.work",
+    g_work_queue = dispatch_queue_create("endptsec.unified.work",
                                          DISPATCH_QUEUE_CONCURRENT);
 
     signal(SIGINT,  on_signal);

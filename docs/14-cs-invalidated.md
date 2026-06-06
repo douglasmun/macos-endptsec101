@@ -104,4 +104,4 @@ codesign status.
 - Uses ch08's process tree to add `cs_invalidated` state to the affected node.
 - Shares the JSON alert output pattern from ch07.
 
-> Not yet implemented.
+> Implemented: `14-cs-invalidated/cs-invalidated.c`

@@ -94,4 +94,4 @@ patching.
   in the allowlist?).
 - `CS_DEBUGGED` detection complements ch07's exec-chain rule.
 
-> Not yet implemented.
+> Implemented: `11-codesign/codesign.c`

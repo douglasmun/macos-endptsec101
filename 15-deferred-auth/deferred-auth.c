@@ -199,7 +199,7 @@ int main(void)
     init_timebase();
 
     g_main_queue = dispatch_get_main_queue();
-    g_work_queue = dispatch_queue_create("argus.deferred",
+    g_work_queue = dispatch_queue_create("endptsec.deferred",
                                          DISPATCH_QUEUE_CONCURRENT);
 
     signal(SIGINT,  on_signal);
