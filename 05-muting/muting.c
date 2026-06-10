@@ -26,6 +26,7 @@
 #include <mach/mach.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 
 static es_client_t     *g_client     = NULL;
@@ -84,20 +85,24 @@ static void handle_event(es_client_t *client __attribute__((unused)),
     }
 }
 
-static void mute_prefix(const char *path)
+static bool mute_prefix(const char *path)
 {
-    if (es_mute_path(g_client, path, ES_MUTE_PATH_TYPE_PREFIX) != ES_RETURN_SUCCESS)
-        fprintf(stderr, "warning: failed to mute PREFIX %s\n", path);
-    else
-        printf("  muted PREFIX  %s\n", path);
+    if (es_mute_path(g_client, path, ES_MUTE_PATH_TYPE_PREFIX) != ES_RETURN_SUCCESS) {
+        fprintf(stderr, "error: failed to mute PREFIX %s\n", path);
+        return false;
+    }
+    printf("  muted PREFIX  %s\n", path);
+    return true;
 }
 
-static void mute_literal(const char *path)
+static bool mute_literal(const char *path)
 {
-    if (es_mute_path(g_client, path, ES_MUTE_PATH_TYPE_LITERAL) != ES_RETURN_SUCCESS)
-        fprintf(stderr, "warning: failed to mute LITERAL %s\n", path);
-    else
-        printf("  muted LITERAL %s\n", path);
+    if (es_mute_path(g_client, path, ES_MUTE_PATH_TYPE_LITERAL) != ES_RETURN_SUCCESS) {
+        fprintf(stderr, "error: failed to mute LITERAL %s\n", path);
+        return false;
+    }
+    printf("  muted LITERAL %s\n", path);
+    return true;
 }
 
 int main(void)
@@ -160,8 +165,18 @@ int main(void)
      */
     printf("muting: configuring allowlist for /usr/bin/*\n");
 
-    mute_prefix("/usr/bin");
-    mute_literal("/usr/sbin/dtrace");
+    /*
+     * Any mute registration failure is fatal. If these entries are missing
+     * when the table is inverted below, the "allowlist" is empty or partial
+     * and the agent ends up reporting (or suppressing) the wrong processes.
+     */
+    bool prefix_ok  = mute_prefix("/usr/bin");
+    bool literal_ok = mute_literal("/usr/sbin/dtrace");
+    if (!prefix_ok || !literal_ok) {
+        fprintf(stderr, "muting: allowlist registration failed — refusing to run\n");
+        es_delete_client(g_client);
+        return 1;
+    }
 
     /*
      * ES_MUTE_INVERSION_TYPE_PATH inverts the path-muting table, which is what
@@ -171,10 +186,16 @@ int main(void)
      * and never achieving the allowlist effect.
      */
     if (es_invert_muting(g_client, ES_MUTE_INVERSION_TYPE_PATH) != ES_RETURN_SUCCESS) {
-        fprintf(stderr, "warning: es_invert_muting failed — running in denylist mode\n");
-    } else {
-        printf("muting: inverted — now in allowlist mode (only /usr/bin/* and /usr/sbin/dtrace)\n");
+        /*
+         * Fatal: without the inversion the mute table is still a denylist,
+         * the exact opposite of the intended allowlist. A security agent
+         * must not run in an inverted-from-intended mode.
+         */
+        fprintf(stderr, "muting: es_invert_muting failed — refusing to run in denylist mode\n");
+        es_delete_client(g_client);
+        return 1;
     }
+    printf("muting: inverted — now in allowlist mode (only /usr/bin/* and /usr/sbin/dtrace)\n");
 
     /* Step 3: subscribe only after muting is fully configured */
     es_event_type_t events[] = { ES_EVENT_TYPE_NOTIFY_EXEC };

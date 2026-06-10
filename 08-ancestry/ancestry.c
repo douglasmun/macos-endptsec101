@@ -215,9 +215,17 @@ static void ancestry_str(const tree_node_t *start, char *buf, size_t bufsz)
 
     /* Prefix only on a missing entry, not on depth==0 — that also covers
      * the launchd case where the self-parent sentinel skipped the walk. */
+    /*
+     * snprintf returns the would-be length, which exceeds the space written
+     * when output is truncated. Clamp pos to bufsz - 1 (the '\0' position)
+     * after every advance so bufsz - pos never underflows.
+     */
     if (missing_root) {
         int rc = snprintf(buf + pos, bufsz - pos, "(unknown) → ");
-        if (rc > 0) pos += (size_t)rc;
+        if (rc > 0) {
+            pos += (size_t)rc;
+            if (pos >= bufsz) pos = bufsz - 1;
+        }
     }
 
     /* Print oldest ancestor first */
@@ -225,11 +233,14 @@ static void ancestry_str(const tree_node_t *start, char *buf, size_t bufsz)
         int rc = snprintf(buf + pos, bufsz - pos,
                           "%s(%d) → ",
                           leaf(stack[i]->path), stack[i]->pid);
-        if (rc > 0) pos += (size_t)rc;
+        if (rc < 0) break;
+        pos += (size_t)rc;
+        if (pos >= bufsz) { pos = bufsz - 1; break; }
     }
 
-    /* Append the process itself */
-    snprintf(buf + pos, bufsz - pos, "%s(%d)", leaf(start->path), start->pid);
+    /* Append the process itself (skip if the buffer is already full) */
+    if (pos < bufsz - 1)
+        snprintf(buf + pos, bufsz - pos, "%s(%d)", leaf(start->path), start->pid);
 }
 
 /* ── rules ────────────────────────────────────────────────────────────────── */

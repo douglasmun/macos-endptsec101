@@ -292,8 +292,8 @@ static void do_shutdown(void *ctx)
 static void on_signal(int sig)
 {
     (void)sig;
-    atomic_store(&g_shutdown, 1);
-    dispatch_async_f(g_main_queue, NULL, do_shutdown);
+    if (!atomic_exchange(&g_shutdown, 1))
+        dispatch_async_f(g_main_queue, NULL, do_shutdown);
 }
 
 /* ── petition handler ─────────────────────────────────────────────────────── */

@@ -96,9 +96,19 @@ static const char *leaf_name(const es_string_token_t *path)
  */
 static int should_deny(const es_process_t *target)
 {
-    const char *name = leaf_name(&target->executable->path);
-    size_t name_len  = (size_t)(target->executable->path.data +
-                                target->executable->path.length - name);
+    const es_string_token_t *path = &target->executable->path;
+    const char *name = leaf_name(path);
+
+    /*
+     * leaf_name returns a literal "" for an empty/NULL path — a pointer that
+     * is not inside the token buffer. Computing a length against the buffer
+     * end would underflow, so only proceed when name points into the buffer.
+     */
+    if (!path->data || path->length == 0 ||
+        name < path->data || name > path->data + path->length)
+        return 0;
+
+    size_t name_len = (size_t)(path->data + path->length - name);
 
     for (const char **entry = g_deny_list; *entry != NULL; entry++) {
         size_t entry_len = strlen(*entry);

@@ -205,7 +205,13 @@ static _Atomic uint64_t    g_deadline_misses = 0;
 static void init_timebase(void)
 {
     mach_timebase_info_data_t info;
-    mach_timebase_info(&info);
+    if (mach_timebase_info(&info) != KERN_SUCCESS || info.numer == 0) {
+        /* On failure info is uninitialized; fall back to a 1:1 timebase
+         * (correct on Apple Silicon) rather than dividing by zero. */
+        fprintf(stderr, "warning: mach_timebase_info failed — assuming 1:1 timebase\n");
+        info.numer = 1;
+        info.denom = 1;
+    }
     g_ticks_per_ms = (uint64_t)(1000000ULL * info.denom / info.numer);
 }
 
@@ -811,6 +817,10 @@ int main(void)
     g_main_queue = dispatch_get_main_queue();
     g_work_queue = dispatch_queue_create("endptsec.unified.work",
                                          DISPATCH_QUEUE_CONCURRENT);
+    if (!g_work_queue) {
+        fprintf(stderr, "dispatch_queue_create failed\n");
+        return 1;
+    }
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
