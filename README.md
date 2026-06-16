@@ -156,7 +156,7 @@ That is the most important thing this project demonstrates: not that one framewo
 |---|---|
 | macOS | 10.15 Catalina or later (Endpoint Security debut) |
 | Root | ES rejects non-root at `es_new_client()` with `ES_NEW_CLIENT_RESULT_ERR_NOT_PRIVILEGED` |
-| Entitlement | `com.apple.developer.endpoint-security.client` — requires active Apple Developer Program membership and a provisioning profile with the ES capability granted |
+| Entitlement | `com.apple.developer.endpoint-security.client` — a **managed** entitlement Apple grants only on request (developer.apple.com → "Request a System Extension or DriverKit Entitlement"). Membership alone does not include it. Once granted, you need a macOS provisioning profile carrying the ES capability. Without it, use ad-hoc signing with SIP disabled (see below). |
 | Full Disk Access | Grant to your terminal in System Settings → Privacy & Security → Full Disk Access |
 
 ## Build
