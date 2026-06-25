@@ -16,6 +16,10 @@
 15-deferred-auth/deferred-auth
 16-unified-agent/unified-agent
 
+# signed .app bundles + object files (build artifacts)
+*.app/
+*.o
+
 # AI tool instruction files
 CLAUDE.md
 AGENTS.md
