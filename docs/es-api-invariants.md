@@ -39,8 +39,23 @@ non-obvious traps the C ES API exposes; every chapter is expected to obey them.
   `g_teardown_lock` around `{ if (g_stop) respond inline; else retain + dispatch_async }`,
   and `do_shutdown` holds the **same** lock across `es_unsubscribe_all`. Then a handler
   mid-enqueue either finished before teardown (its worker is drained by the barrier) or
-  observes `g_stop==1` under the lock and never dispatches. Release the lock before the
-  barrier to avoid a lock-ordering deadlock with workers.
+  observes `g_stop==1` under the lock and never dispatches.
+- The teardown lock must be held **only across `es_unsubscribe_all`**, *not* across the
+  barrier or `es_delete_client` (ch16, Round 17 B83). `es_delete_client` blocks until any
+  in-flight handler callback returns; an AUTH callback that is waiting to acquire
+  `g_teardown_lock` cannot return until the lock is released — holding the lock across the
+  delete is a classic lock-vs-join deadlock (shutdown waits for the callback, the callback
+  waits for the lock). Release the lock right after `es_unsubscribe_all`, *then*
+  barrier-drain and delete.
+- The inline shutdown response must use the **handler callback's own `client` argument**,
+  never the global `g_client` (ch16, Round 16 B81). ES keeps the `client` argument valid
+  for the entire callback, and `es_delete_client` blocks until in-flight callbacks return —
+  so a handler that responds via `client` always lands on a live client *even though*
+  `do_shutdown` deletes outside the lock. This is what makes releasing the lock before the
+  delete safe. Do **not** NULL-guard the response (`if (g_client) respond`) and skip it
+  when null: skipping leaves the operation unanswered, the kernel applies its deadline
+  default of **ALLOW**, and a fail-closed AUTH client is silently defeated at shutdown.
+  Always respond.
 
 ## AUTH vs NOTIFY responses
 
@@ -58,6 +73,14 @@ non-obvious traps the C ES API exposes; every chapter is expected to obey them.
   on the deadline path on *both* event types; a deliberate fail-open default (e.g. the
   high-volume OOM path for opens, where failing closed would freeze the system) is
   acceptable only if explicitly documented at the site.
+- A fail-closed deadline path must apply the **same full policy predicate** the normal path
+  would use to DENY — not a looser proxy (ch16, Round 14 B76). A deadline-deny that fires on
+  the target *path alone*, before the platform-binary and write-flag (`FWRITE`) checks,
+  denies legitimate access under mere queue pressure: a platform binary, or a read-only
+  open of a sensitive path, gets blocked just because the queue is backlogged. Replicate the
+  whole predicate (`FWRITE` set && non-platform && empty `team_id` && sensitive path) on the
+  deadline branch so it denies exactly what the unhurried path would, and allows everything
+  else.
 
 ## Message & field validity
 
@@ -132,6 +155,11 @@ non-obvious traps the C ES API exposes; every chapter is expected to obey them.
   pre-exec entry before breaking. The per-table "remove old regardless of alloc success"
   rule is defeated if the tree-OOM short-circuit skips the state-migration block entirely
   (Round 13 B72) — the state entry then leaks. Run both removals on the early-exit path.
+- That cross-table early-exit cleanup must **carry the same `old != new` aliasing guard** as
+  the normal migration (ch16, Round 14 B77). On the tree-OOM `break` path, removing the
+  pre-exec state entry unconditionally drops the *live post-exec* entry when pre- and
+  post-exec tokens are equal — exactly the use-after-free / counter-reset the main-path guard
+  prevents. Guard it: `if (!token_eq(&pre, &post) && state_find(&pre)) state_remove(&pre);`.
 - When no FORK was observed for a process (it was already running at subscribe time),
   fall back to `target->parent_audit_token` from the EXEC event as the best available
   parent link.
@@ -187,3 +215,20 @@ non-obvious traps the C ES API exposes; every chapter is expected to obey them.
 
 - In BTM handlers, `instigator` may be NULL — always NULL-check before dereferencing.
   Fall back to `msg->process` when NULL.
+- A keyed pending-install table (ch10 Rule 3: install-then-remove correlation) must
+  **dedup on the key** before allocating a new slot (Round 13 B74). A repeated ADD of the
+  same `item_url` (an installer rewriting a plist) otherwise creates duplicate slots; a
+  single REMOVE clears only one, and oldest-by-time eviction can discard a distinct pending
+  item before its REMOVE arrives, suppressing the alert. Refresh the existing slot in place.
+- The dedup/match key must be the **full token bytes, never a fixed-size buffer** (ch10,
+  Round 14 B78 / Round 15 B80). `item_url` is not NUL-terminated and a file:// URL with a
+  deep path or percent-encoding can exceed PATH_MAX; *any* fixed buffer (512, 4096, …) has a
+  truncation threshold at which two distinct URLs sharing that prefix collapse into one slot,
+  so a later REMOVE clears the wrong install. Store a `malloc`'d copy of the exact token
+  bytes plus its byte length and match with length + `memcmp` — no threshold exists. Keep a
+  separate small buffer for *logging* only.
+- Allocate the replacement key **before** evicting a victim slot (ch10, Round 16 B82). If
+  the table is full and you `slot_clear` the oldest entry first, a subsequent failing
+  `malloc` has discarded a valid pending install with nothing to replace it — its REMOVE then
+  misses the alert. `malloc`+`memcpy` first; only choose and clear a victim once the copy
+  succeeded. On OOM drop the ADD and leave existing entries intact.
