@@ -14,6 +14,7 @@ Audit findings and fixes across all chapters.
 - Round 11: deep re-audit of `01-hello-exec` through `08-ancestry` — 3 findings (`03-auth-exec`, `08-ancestry` ×2); ch01/02/04/05/06/07 clean
 - Round 12: deep re-audit of `09-tcc` through `16-unified-agent` — 7 findings (`16` ×2, `15`, `09`, `10`, `12` ×2); ch11/13/14 clean
 - Round 13: adversarial cross-chapter audit (5 cross-cutting lenses × 16 files, each finding adversarially verified) — 7 findings (`16` ×4, `13`/`14`, `10`); recurring theme: ch16 capstone reimplemented subsystems and dropped hardening the standalone chapters received in rounds 10–12. ch01/02/04/05/06/07/08/11/12/15 clean for all lenses
+- Round 14: Codex review of the round-13 patch (`--base cc192b9`) — 4 findings (`16` ×3, `10`); all were incomplete/regressive round-13 fixes: the B68 inline-response left the lock too early, the B73 deadline-deny dropped the write/platform predicates, the B72 OOM cleanup lacked the token-equality guard, and the B74 dedup key was truncated below the URL divergence point
 
 ---
 
@@ -799,3 +800,39 @@ AUTH_OPEN failed open (ALLOW) on a deadline miss while sibling AUTH_EXEC failed 
 `pending_add` took the first empty slot with no key dedup, and Rule 3 calls it on every BTM ADD. A repeated ADD of the same `item_url` (installer rewriting a LaunchAgent plist) created duplicate slots; `pending_remove` cleared only the first, so duplicates persisted and the oldest-by-`install_time` eviction could discard a genuinely distinct pending item before its REMOVE arrived, suppressing the Rule-3 "execute-once-cleanup" alert. This logic lives only in ch10 (ch16 dropped Rule 3) and was never re-reviewed.
 
 **Fix:** `pending_add` now first scans for an existing slot with a matching `exec_path` and refreshes its `install_time` in place instead of allocating a second slot.
+
+## Round 14 — Codex review of the round-13 patch
+
+Codex reviewed the round-13 diff against `cc192b9`. All four findings were defects in round-13 fixes themselves — three regressions/incompletions in the ch16 capstone and one truncated key in ch10.
+
+### B75: unified-agent inline AUTH response released the teardown lock before responding (B68 incomplete)
+**Severity:** High
+**Location:** `16-unified-agent/unified-agent.c`, AUTH_EXEC and AUTH_OPEN handler cases
+
+B68 serialized the check-retain-dispatch under `g_teardown_lock`, but the `g_stop`-set branch unlocked **before** calling `es_respond_auth_result(g_client, …)`. With the lock released, `do_shutdown` (which holds the same lock across `es_unsubscribe_all`, then drains the barrier and `es_delete_client`s `g_client`) could free/null the client between the unlock and the inline response — the exact shutdown use-after-free B68 was meant to close, in both AUTH branches.
+
+**Fix:** Move `es_respond_auth_result` **inside** the lock in both branches; unlock only after responding. `do_shutdown` cannot delete the client while the handler holds the lock.
+
+### B76: unified-agent AUTH_OPEN deadline-deny ignored the write/platform predicates (B73 regression)
+**Severity:** Medium
+**Location:** `16-unified-agent/unified-agent.c`, `evaluate_open_and_respond()` deadline-miss branch
+
+B73's fail-closed deadline path denied any `is_sensitive_path` open, running **before** the platform-binary and `FWRITE` checks. Under work-queue backlog this denied a platform binary's open or a read-only open of `/etc/hosts` — legitimate system access disrupted purely by queue pressure.
+
+**Fix:** The deadline branch now applies the **full** policy predicate (`FWRITE` set && non-platform && empty `team_id` && sensitive path) before denying; everything else fails open as before.
+
+### B77: unified-agent tree-OOM state cleanup lacked the token-equality guard (B72 incomplete)
+**Severity:** Low
+**Location:** `16-unified-agent/unified-agent.c`, NOTIFY_EXEC tree-allocation-failure early-exit
+
+B72 added a state-table cleanup to the tree-OOM `break` path, but called `state_remove` unconditionally. When pre- and post-exec audit tokens are equal, the entry found there **is** the live post-exec state — removing it drops a tracked process and resets its counters. The normal migration guards `old_s != s`; this path did not.
+
+**Fix:** Guard the cleanup with `!token_eq(&pre, &post)` so the live entry is preserved when the tokens match.
+
+### B78: persistence dedup key truncated below the item_url divergence point (B74 incomplete)
+**Severity:** Low
+**Location:** `10-persistence/persistence.c`, `pending_add()` / `plist_buf`
+
+B74 deduplicated on `exec_path`, but the key was a 512-byte truncated copy of `item_url`. Two distinct `item_url`s sharing their first 511 bytes (deep file:// paths, percent-encoding) collapsed into one slot; the first REMOVE cleared it and the second persistence removal was missed.
+
+**Fix:** Widen the key to `ITEM_URL_MAX` (4096) in the table struct and in both ADD/REMOVE `plist_buf` copies so distinct URLs are not collapsed by truncation before the `strcmp`.

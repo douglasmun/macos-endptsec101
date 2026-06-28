@@ -12,8 +12,15 @@
 /* ── pending-install table for rule 3 (install-then-remove) ── */
 #define PENDING_TABLE_SIZE 32
 
+/* item_url is the dedup/match key for rule 3. It must hold the full URL: a
+ * file:// URL with a deep path and percent-encoding can exceed PATH_MAX, and
+ * any truncation that collapses two distinct item_urls to the same prefix would
+ * make a later REMOVE clear the wrong slot and miss a genuine persistence
+ * removal. Size for ~4x PATH_MAX to make a collision implausible. */
+#define ITEM_URL_MAX 4096
+
 typedef struct {
-    char   exec_path[512];
+    char   exec_path[ITEM_URL_MAX];
     time_t install_time;
 } pending_install_t;
 
@@ -75,7 +82,9 @@ static void pending_add(const char *exec_path)
      * rewriting a plist) must refresh the existing slot, not allocate a second.
      * Without this, duplicates accumulate — a single REMOVE clears only the
      * first, and oldest-by-install_time eviction can discard a distinct pending
-     * item before its REMOVE arrives, suppressing the Rule-3 alert. */
+     * item before its REMOVE arrives, suppressing the Rule-3 alert. The key is
+     * stored at ITEM_URL_MAX width so two distinct item_urls are not collapsed
+     * by truncation before this strcmp. */
     for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
         if (g_pending[i].exec_path[0] != '\0' &&
             strcmp(g_pending[i].exec_path, exec_path) == 0) {
@@ -148,9 +157,9 @@ static void handle_event(es_client_t *client, const es_message_t *msg)
 
         /* executable_path is a field on the add-event itself (may be empty);
            item->item_url is the plist/item URL */
-        char exec_buf[512]  = "(none)";
-        char plist_buf[512] = "(none)";
-        char ins_path[512]  = "(unknown)";
+        char exec_buf[512]            = "(none)";
+        char plist_buf[ITEM_URL_MAX]  = "(none)";  /* rule-3 key — full URL */
+        char ins_path[512]            = "(unknown)";
 
         if (ev->executable_path.length > 0)
             copy_str_token(exec_buf, sizeof(exec_buf), &ev->executable_path);
@@ -199,9 +208,9 @@ static void handle_event(es_client_t *client, const es_message_t *msg)
         const es_process_t                      *ins  = ev->instigator;
         if (!ins) ins = msg->process;
 
-        char app_buf[512]   = "(none)";
-        char plist_buf[512] = "(none)";
-        char ins_path[512]  = "(unknown)";
+        char app_buf[512]            = "(none)";
+        char plist_buf[ITEM_URL_MAX] = "(none)";  /* rule-3 key — full URL */
+        char ins_path[512]           = "(unknown)";
 
         /* BTM_REMOVE has no executable_path field — use item_url and app_url */
         if (item->app_url.length > 0)

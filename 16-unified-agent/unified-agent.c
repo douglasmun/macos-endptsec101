@@ -516,13 +516,20 @@ static void evaluate_open_and_respond(auth_ctx_t *ctx)
     if (now >= deadline ||
         (deadline - now) < MIN_WORK_BUDGET_MS * g_ticks_per_ms) {
         atomic_fetch_add(&g_deadline_misses, 1);
-        /* Fail closed for sensitive paths to match AUTH_EXEC's fail-closed
-         * deadline behavior — otherwise an attacker could defeat the
-         * sensitive-write rule by driving the work queue into backlog. Other
-         * opens still fail open (monitoring-leaning default for the common case). */
+        /* Fail closed only for opens the normal policy path would itself DENY:
+         * a write open of a sensitive path by a non-platform process with no
+         * team_id. Applying the full predicate (not path alone) prevents a
+         * backlog from denying a platform binary or a read-only open of
+         * /etc/hosts, while still matching AUTH_EXEC's fail-closed deadline
+         * behavior for the genuinely sensitive case. */
         char dpath[PATH_BUF];
         copy_str_token(dpath, sizeof(dpath), &file->path);
-        es_auth_result_t verdict = is_sensitive_path(dpath)
+        uint32_t fflag = msg->event.open.fflag;
+        int would_deny = (fflag & FWRITE) &&
+                         !proc->is_platform_binary &&
+                         proc->team_id.length == 0 &&
+                         is_sensitive_path(dpath);
+        es_auth_result_t verdict = would_deny
                                    ? ES_AUTH_RESULT_DENY : ES_AUTH_RESULT_ALLOW;
         fprintf(stderr, "[WARN] deadline-miss AUTH_OPEN pid=%d path=%s — %s\n",
                 pid, dpath,
@@ -611,7 +618,13 @@ static void handle_event(es_client_t *client __attribute__((unused)),
              * the IDS-state migration block below is skipped by this break,
              * so its state_remove never runs without this. */
             if (old) tree_remove(&msg->process->audit_token);
-            if (state_find(&msg->process->audit_token))
+            /* Only remove the pre-exec state when the tokens differ. If pre and
+             * post-exec tokens are equal (exec without a token change), the entry
+             * found here IS the live post-exec state — removing it would drop a
+             * tracked process and reset its counters. Mirrors the old_s != s
+             * migration guard below. */
+            if (!token_eq(&msg->process->audit_token, &target->audit_token) &&
+                state_find(&msg->process->audit_token))
                 state_remove(&msg->process->audit_token);
             break;
         }
@@ -816,8 +829,12 @@ static void handle_event(es_client_t *client __attribute__((unused)),
          * do_shutdown's barrier+delete. If shutdown began, respond inline. */
         os_unfair_lock_lock(&g_teardown_lock);
         if (atomic_load(&g_stop)) {
-            os_unfair_lock_unlock(&g_teardown_lock);
+            /* Respond INSIDE the lock: do_shutdown holds the same lock across
+             * es_unsubscribe_all and only deletes g_client after the lock is
+             * released and the barrier drains. Releasing here before responding
+             * would let do_shutdown delete g_client before this call runs. */
             es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+            os_unfair_lock_unlock(&g_teardown_lock);
             free(ctx);
             break;
         }
@@ -851,8 +868,9 @@ static void handle_event(es_client_t *client __attribute__((unused)),
 
         os_unfair_lock_lock(&g_teardown_lock);
         if (atomic_load(&g_stop)) {
-            os_unfair_lock_unlock(&g_teardown_lock);
+            /* Respond INSIDE the lock — see AUTH_EXEC note above. */
             es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+            os_unfair_lock_unlock(&g_teardown_lock);
             free(ctx);
             break;
         }
