@@ -98,7 +98,10 @@ static time_t pending_remove(const char *exec_path)
         {
             time_t t = g_pending[i].install_time;
             g_pending[i].exec_path[0] = '\0';
-            if (now - t <= 60)
+            /* now >= t guards against a backward clock step: time_t is signed,
+             * so now < t would make (now - t) negative and pass the <= 60 test,
+             * firing the rule with a nonsensical negative elapsed time. */
+            if (now >= t && now - t <= 60)
                 return t;
             return 0;
         }

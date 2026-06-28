@@ -154,16 +154,26 @@ static void do_shutdown(void *ctx)
     fflush(stdout);
 
     /*
-     * Drain in-flight deferred AUTH workers before tearing down the client.
-     * Workers on the concurrent g_work_queue call es_respond_auth_result(g_client,
-     * ...) and es_release_message(); deleting the client while one is in flight is
-     * a use-after-free. The barrier waits for all queued/running blocks to finish.
+     * Order matters to avoid a use-after-free:
+     *   1. es_unsubscribe_all — stop new AUTH_EXEC deliveries to the handler.
+     *   2. dispatch_barrier_sync — drain workers already in flight; they call
+     *      es_respond_auth_result(g_client,...)/es_release_message().
+     *   3. es_delete_client — only now is no worker still touching g_client.
+     *
+     * The barrier alone is insufficient: it waits only for blocks enqueued
+     * before it. If the client were still subscribed during the barrier, a new
+     * event could enqueue a worker after the barrier completed but before
+     * es_delete_client, and that worker would touch a freed client. Unsubscribe
+     * first closes that window; the g_running gate in handle_event closes the
+     * narrower race where a handler callback is already mid-flight.
      */
+    if (g_client)
+        es_unsubscribe_all(g_client);
+
     if (g_work_queue)
         dispatch_barrier_sync(g_work_queue, ^{});
 
     if (g_client) {
-        es_unsubscribe_all(g_client);
         es_delete_client(g_client);
         g_client = NULL;
     }
@@ -182,10 +192,17 @@ static void on_signal(int sig)
 
 static void handle_event(es_client_t *client, const es_message_t *msg)
 {
-    (void)client;
-
     switch (msg->event_type) {
     case ES_EVENT_TYPE_AUTH_EXEC:
+        /*
+         * Once shutdown has begun, stop retaining/dispatching. A worker
+         * enqueued now could outlive es_delete_client. Respond ALLOW inline so
+         * the kernel is not left waiting for this message.
+         */
+        if (!atomic_load(&g_running)) {
+            es_respond_auth_result(client, msg, ES_AUTH_RESULT_ALLOW, false);
+            break;
+        }
         /*
          * Retain the message so it remains valid after this callback returns.
          * The background block owns the retain; evaluate_and_respond releases it.

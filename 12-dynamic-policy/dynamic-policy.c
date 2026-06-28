@@ -47,8 +47,19 @@ static int load_config(const char *path)
     int count = 0;
     char line[MAX_PATH_LEN];
     while (fgets(line, sizeof(line), f) && count < MAX_MUTE_PATHS) {
-        /* Strip trailing newline */
         size_t len = strlen(line);
+
+        /* A line that does not end in '\n' (and is not at EOF) was truncated by
+         * fgets; drain the remainder and skip it rather than treating the tail
+         * as a bogus second path. */
+        int truncated = (len > 0 && line[len - 1] != '\n' && !feof(f));
+        if (truncated) {
+            int c;
+            while ((c = fgetc(f)) != '\n' && c != EOF)
+                ;
+            continue;
+        }
+
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = '\0';
 
@@ -102,6 +113,13 @@ static void reload_config(void *ctx)
     char line[MAX_PATH_LEN];
     while (fgets(line, sizeof(line), f) && new_count < MAX_MUTE_PATHS) {
         size_t len = strlen(line);
+        /* Skip an over-length (truncated) line; drain to its newline. */
+        if (len > 0 && line[len-1] != '\n' && !feof(f)) {
+            int c;
+            while ((c = fgetc(f)) != '\n' && c != EOF)
+                ;
+            continue;
+        }
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
             line[--len] = '\0';
         if (len == 0 || line[0] == '#') continue;
@@ -249,6 +267,7 @@ int main(void)
     /* Initial config load */
     int loaded = load_config(CONFIG_PATH);
     printf("[CONFIG] initial load: %d paths\n", loaded);
+    fflush(stdout);
 
     /* Apply initial mutes */
     for (int i = 0; i < g_mute_count; i++) {

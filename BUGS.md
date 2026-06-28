@@ -12,6 +12,7 @@ Audit findings and fixes across all chapters.
 - Round 9: `16-unified-agent` — 4 findings
 - Round 10: `15-deferred-auth`, `13-auth-open` — 3 findings
 - Round 11: deep re-audit of `01-hello-exec` through `08-ancestry` — 3 findings (`03-auth-exec`, `08-ancestry` ×2); ch01/02/04/05/06/07 clean
+- Round 12: deep re-audit of `09-tcc` through `16-unified-agent` — 7 findings (`16` ×2, `15`, `09`, `10`, `12` ×2); ch11/13/14 clean
 
 ---
 
@@ -649,3 +650,77 @@ Per-chapter deep audit of the eight earliest chapters against every CLAUDE.md in
 `copy_str_token(n->path, PATH_BUF, &msg->process->executable->path)` (FORK) and `&target->executable->path` (EXEC) formed the token pointer by dereferencing `executable` before the call. `copy_str_token` already NULL-checks the token, but the `executable` deref happened first — a NULL `executable` would crash. ES populates `executable` for FORK/EXEC in practice (so this is defensive, not a confirmed crash), but the BTM handlers in ch10/ch16 already NULL-check `instigator`, and the project's posture is to not leave such derefs load-bearing.
 
 **Fix:** Added a `copy_exec_path(buf, bufsz, proc)` helper that guards `proc && proc->executable` before copying (and writes an empty string otherwise). Both call sites now route through it. The `print_path(target->executable)` call on the EXEC log line was already NULL-safe (`print_path` NULL-checks its argument).
+
+---
+
+## Round 12 — deep re-audit of ch09–ch16
+
+Per-chapter deep audit of the eight later chapters against every CLAUDE.md invariant. `11-codesign`, `13-auth-open`, and `14-cs-invalidated` verified clean (per-path AUTH responses, cdhash byte/hex handling, FWRITE-vs-O_flag test, token-keyed invalidated table + lifecycle — all correct). Seven findings.
+
+### B61: unified-agent IDS state migration missing `old_s != s` aliasing guard — use-after-free
+**Severity:** High
+**Location:** `16-unified-agent/unified-agent.c`, NOTIFY_EXEC handler, IDS state migration block
+
+The tree migration block correctly guards `if (old && old != n)` (the documented invariant: equal pre/post tokens mean `tree_remove` would free the live node before use). The IDS state migration block directly below it did **not** carry the same guard — it used `if (old_s)`. When the pre-exec and post-exec audit tokens are equal, `state_find(pre)` and `state_get_or_create(post)` return the **same** pointer (`old_s == s`); `state_remove(pre)` then frees `s`, and the immediately following `copy_str_token(s->path, ...)`, `rule_exec_chain(s)`, `rule_sensitive_file_write(s)` dereference freed memory (use-after-free, read + write). This is the same class as B31 (fixed in ch08's tree path) but in ch16's state path.
+
+**Fix:** Changed the guard to `if (old_s && old_s != s)`, mirroring the tree-migration guard directly above. When `old_s == s` no copy/remove is needed — the entry is already the live one.
+
+---
+
+### B62: deferred-auth residual shutdown use-after-free — barrier runs before unsubscribe
+**Severity:** High
+**Location:** `15-deferred-auth/deferred-auth.c`, `do_shutdown()` / `handle_event()`
+
+B55 added `dispatch_barrier_sync(g_work_queue, ^{})` before `es_delete_client`, but the barrier ran **before** `es_unsubscribe_all` while the client was still subscribed. A `dispatch_barrier_sync` only waits for blocks enqueued before it. If an `AUTH_EXEC` arrived during or just after the barrier, `handle_event` would `es_retain_message` + `dispatch_async` a **new** worker that the completed barrier never waited for; that worker then ran after `es_delete_client` and called `es_respond_auth_result(g_client,...)`/`es_release_message` on a freed client — the same UAF B55 aimed to close, through a narrower window.
+
+**Fix:** Reordered `do_shutdown` to (1) `es_unsubscribe_all` (stop new deliveries), (2) `dispatch_barrier_sync` (drain in-flight workers), (3) `es_delete_client`. Additionally gated `handle_event`'s AUTH_EXEC case on `if (!atomic_load(&g_running))` — once shutdown has begun it responds ALLOW inline instead of retaining/dispatching, closing the narrower race where a handler callback is already mid-flight when unsubscribe lands. (`g_running` was previously set but never read; it is now wired in.)
+
+---
+
+### B63: unified-agent residual shutdown use-after-free — same pattern as B62
+**Severity:** High
+**Location:** `16-unified-agent/unified-agent.c`, `do_shutdown()` / `handle_event()`
+
+`do_shutdown` called `dispatch_barrier_sync(g_work_queue, ^{})` then `es_delete_client` with no `es_unsubscribe_all` first, and the AUTH_EXEC / AUTH_OPEN handler cases retained + dispatched workers without checking the shutdown flag. Identical residual-window UAF to B62, on both deferred-AUTH event types.
+
+**Fix:** `do_shutdown` now calls `es_unsubscribe_all(g_client)` before the barrier. Both AUTH_EXEC and AUTH_OPEN cases gained an `if (atomic_load(&g_stop))` guard at the top that responds inline (ALLOW) instead of enqueuing a worker once shutdown has begun.
+
+---
+
+### B64: tcc handlers dereference `actor->executable` without a NULL check
+**Severity:** Medium
+**Location:** `09-tcc/tcc.c`, `handle_petition()` and `handle_judgement()`
+
+`es_process_t.executable` may be NULL (the project NULL-checks it elsewhere, e.g. ch08). Both TCC handlers dereferenced it unguarded: `print_path(actor->executable)` (petition + judgement), `copy_str_token(path_str, ..., &actor->executable->path)` and `path_contains_browser(&actor->executable->path)` (judgement Rule 2). `print_path` itself also dereferenced `file->path` with no NULL guard. A judgement/petition whose actor has a NULL executable would crash the entire ES client.
+
+**Fix:** Made `print_path` NULL-safe (prints `(unknown)` for a NULL file). In `handle_judgement`, captured `const es_file_t *exe = actor->executable` once, initialized `path_str` to `"(unknown)"`, and guarded the `copy_str_token`/truncation/`path_contains_browser` work behind `if (exe)`. The petition path is covered by the now-NULL-safe `print_path`.
+
+---
+
+### B65: persistence install-then-remove window underflows on backward clock step
+**Severity:** Low
+**Location:** `10-persistence/persistence.c`, `pending_remove()`
+
+`if (now - t <= 60)` — `time_t` is signed. A backward wall-clock step (NTP correction, VM resume) makes `now < t`, so `now - t` is negative and passes the `<= 60` test, firing Rule 3 (`execute-once-cleanup`) and printing a nonsensical negative elapsed time.
+
+**Fix:** Guarded with `if (now >= t && now - t <= 60)`. The downstream `now - install_t` print is then always non-negative.
+
+---
+
+### B66: dynamic-policy config parser treats an over-length line's tail as a second path
+**Severity:** Low
+**Location:** `12-dynamic-policy/dynamic-policy.c`, `load_config()` and `reload_config()`
+
+Both parse loops use `fgets(line, MAX_PATH_LEN, f)`. A config line longer than `MAX_PATH_LEN-1` is split across two `fgets` calls; the continuation was then processed as a separate path entry, producing a bogus mute prefix. Not memory-unsafe (bounds are correct) but a malformed-config correctness issue.
+
+**Fix:** In both loops, detect a line that did not end in `'\n'` (and is not at EOF), drain the remainder with `fgetc` until newline/EOF, and skip the entry.
+
+---
+
+### B67: dynamic-policy initial-load status line not flushed
+**Severity:** Nit
+**Location:** `12-dynamic-policy/dynamic-policy.c`, `main()`
+
+Every other status print in the file flushes stdout, but `printf("[CONFIG] initial load: %d paths\n", loaded)` did not. On a pipe/non-TTY stdout it could be buffered and reordered after later flushed output, or lost on kill.
+
+**Fix:** Added `fflush(stdout)` after the line.

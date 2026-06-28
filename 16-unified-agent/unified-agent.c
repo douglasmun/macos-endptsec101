@@ -370,6 +370,13 @@ static void rule_fanout(proc_state_t *s, time_t now)
 
 static void do_shutdown(void *ctx __attribute__((unused)))
 {
+    /* Unsubscribe before draining: the barrier waits only for workers already
+     * enqueued. With the client still subscribed during the barrier, a new
+     * AUTH event could enqueue a worker afterward that touches a freed client.
+     * Unsubscribe stops new deliveries; the g_stop gate in handle_event covers
+     * the in-flight-callback race; then the barrier drains; then we delete. */
+    if (g_client)
+        es_unsubscribe_all(g_client);
     dispatch_barrier_sync(g_work_queue, ^{});
     if (g_client) {
         es_delete_client(g_client);
@@ -583,7 +590,9 @@ static void handle_event(es_client_t *client __attribute__((unused)),
         /* ── IDS state migration ── */
         proc_state_t *old_s = state_find(&msg->process->audit_token);
         proc_state_t *s     = state_get_or_create(&target->audit_token, pid);
-        if (old_s) {
+        if (old_s && old_s != s) {
+            /* Guard old_s != s: equal pre/post tokens mean state_remove would
+             * free s before it is used below (use-after-free). */
             if (s) {
                 s->exec_count        = old_s->exec_count;
                 s->exec_window_start = old_s->exec_window_start;
@@ -755,6 +764,12 @@ static void handle_event(es_client_t *client __attribute__((unused)),
 
     /* ── AUTH_EXEC ──────────────────────────────────────────────────────── */
     case ES_EVENT_TYPE_AUTH_EXEC: {
+        /* Shutdown started: don't enqueue a worker that could outlive the
+         * client. Respond ALLOW inline so the kernel isn't left waiting. */
+        if (atomic_load(&g_stop)) {
+            es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+            break;
+        }
         auth_ctx_t *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
             /* Allocation failure: deny conservatively */
@@ -781,6 +796,10 @@ static void handle_event(es_client_t *client __attribute__((unused)),
 
     /* ── AUTH_OPEN ──────────────────────────────────────────────────────── */
     case ES_EVENT_TYPE_AUTH_OPEN: {
+        if (atomic_load(&g_stop)) {
+            es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+            break;
+        }
         auth_ctx_t *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
             es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);

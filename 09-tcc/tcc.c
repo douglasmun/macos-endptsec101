@@ -139,6 +139,7 @@ static void copy_str_token(char *buf, size_t bufsz, const es_string_token_t *s)
  */
 static void print_path(const es_file_t *file)
 {
+    if (!file) { printf("(unknown)"); return; }
     printf("%.*s", (int)file->path.length, file->path.data);
     if (file->path_truncated)
         printf(" (truncated)");
@@ -348,14 +349,18 @@ static void handle_judgement(const es_message_t *msg)
         if (!right_is_tcc(&result->right_name))
             continue;
 
+        const es_file_t *exe = actor->executable;
+
         char right_str[RIGHT_BUF];
-        char path_str[PATH_BUF];
+        char path_str[PATH_BUF] = "(unknown)";
         copy_str_token(right_str, sizeof(right_str), &result->right_name);
-        copy_str_token(path_str, sizeof(path_str), &actor->executable->path);
-        /* Append truncation marker so alert lines match the info line */
-        if (actor->executable->path_truncated &&
-            strlen(path_str) + sizeof("...(truncated)") < PATH_BUF)
-            strlcat(path_str, "...(truncated)", sizeof(path_str));
+        if (exe) {
+            copy_str_token(path_str, sizeof(path_str), &exe->path);
+            /* Append truncation marker so alert lines match the info line */
+            if (exe->path_truncated &&
+                strlen(path_str) + sizeof("...(truncated)") < PATH_BUF)
+                strlcat(path_str, "...(truncated)", sizeof(path_str));
+        }
 
         printf("[TCC] right=%s pid=%d path=", right_str, pid);
         print_path(actor->executable);
@@ -377,7 +382,7 @@ static void handle_judgement(const es_message_t *msg)
         /* ── Rule 2: FDA acquired by browser-named process */
         if (service_suffix_eq(&result->right_name,
                               "kTCCServiceSystemPolicyAllFiles") &&
-            path_contains_browser(&actor->executable->path))
+            exe && path_contains_browser(&exe->path))
         {
             fprintf(stderr,
                 "[ALERT] fda-from-browser: pid=%d path=%s acquired FDA\n",
