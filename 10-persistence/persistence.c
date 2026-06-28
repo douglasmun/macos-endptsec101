@@ -106,12 +106,20 @@ static void pending_add(const char *key, size_t len)
             return;
         }
     }
+    /* Allocate the replacement BEFORE choosing/clearing a victim slot. If malloc
+     * fails after eviction, we would have discarded a valid pending install with
+     * nothing to put in its place — a later REMOVE for that item would then miss
+     * the Rule-3 alert. Alloc first; only mutate the table once it succeeds. */
+    char *copy = malloc(len);
+    if (!copy) return;  /* OOM: drop this ADD; leave existing entries intact */
+    memcpy(copy, key, len);
+
     int target = -1;
     for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
         if (g_pending[i].key == NULL) { target = i; break; }
     }
     if (target < 0) {
-        /* table full — evict oldest */
+        /* table full — evict oldest (its key is freed by slot_clear) */
         target = 0;
         for (int i = 1; i < PENDING_TABLE_SIZE; i++) {
             if (g_pending[i].install_time < g_pending[target].install_time)
@@ -119,9 +127,6 @@ static void pending_add(const char *key, size_t len)
         }
         slot_clear(&g_pending[target]);
     }
-    char *copy = malloc(len);
-    if (!copy) return;  /* OOM: drop this pending entry rather than truncate */
-    memcpy(copy, key, len);
     g_pending[target].key         = copy;
     g_pending[target].key_len     = len;
     g_pending[target].install_time = now;

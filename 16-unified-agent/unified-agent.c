@@ -389,19 +389,15 @@ static void do_shutdown(void *ctx __attribute__((unused)))
      * enqueued. With the client still subscribed during the barrier, a new
      * AUTH event could enqueue a worker afterward that touches a freed client.
      *
-     * The teardown lock closes the in-flight-callback race that g_stop alone
-     * cannot. It must be held across the ENTIRE teardown — unsubscribe, drain,
-     * AND es_delete_client — not just the unsubscribe. If the lock is released
-     * before deletion, a handler that was blocked on the lock during unsubscribe
-     * can acquire it afterward, observe g_stop==1, and call
-     * es_respond_auth_result(g_client, …) while (or after) this function deletes
-     * g_client — the very use-after-free the lock is meant to prevent. Holding
-     * the lock through deletion makes the inline-response branch and client
-     * deletion mutually exclusive. The dispatched workers
-     * (evaluate_*_and_respond) never take this lock, so holding it across the
-     * barrier cannot deadlock the drain. After deletion g_client is NULL under
-     * the lock, so any handler that acquires the lock later finds g_client==NULL
-     * and skips the response (kernel defaults to ALLOW at its deadline). */
+     * The teardown lock closes the in-flight-callback enqueue race that g_stop
+     * alone cannot, and is held across the ENTIRE teardown — unsubscribe, drain,
+     * es_delete_client — so the inline-response branch and client deletion are
+     * mutually exclusive. The AUTH handler responds via its `client` argument,
+     * which ES keeps valid for the callback's duration; es_delete_client itself
+     * blocks until in-flight callbacks return, so a handler that is mid-callback
+     * always responds against a live client before this delete can complete.
+     * The dispatched workers (evaluate_*_and_respond) never take this lock, so
+     * holding it across the barrier cannot deadlock the drain. */
     os_unfair_lock_lock(&g_teardown_lock);
     if (g_client) {
         es_unsubscribe_all(g_client);
@@ -591,7 +587,7 @@ static void evaluate_open_and_respond(auth_ctx_t *ctx)
 
 /* ── event handler ────────────────────────────────────────────────────────── */
 
-static void handle_event(es_client_t *client __attribute__((unused)),
+static void handle_event(es_client_t *client,
                          const es_message_t *msg)
 {
     switch (msg->event_type) {
@@ -820,7 +816,7 @@ static void handle_event(es_client_t *client __attribute__((unused)),
         auth_ctx_t *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
             /* Allocation failure: deny conservatively */
-            es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_DENY, false);
+            es_respond_auth_result(client, msg, ES_AUTH_RESULT_DENY, false);
             break;
         }
 
@@ -835,14 +831,14 @@ static void handle_event(es_client_t *client __attribute__((unused)),
          * do_shutdown's barrier+delete. If shutdown began, respond inline. */
         os_unfair_lock_lock(&g_teardown_lock);
         if (atomic_load(&g_stop)) {
-            /* Respond INSIDE the lock: do_shutdown holds the same lock across
-             * the entire teardown (unsubscribe → barrier → es_delete_client), so
-             * while we hold it the client cannot be deleted. If this handler was
-             * blocked on the lock until AFTER teardown completed, g_client is now
-             * NULL — skip the response (kernel ALLOWs at its deadline) rather
-             * than dereference a freed client. */
-            if (g_client)
-                es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+            /* Respond INSIDE the lock so the inline response and do_shutdown's
+             * teardown are mutually exclusive. Use the `client` argument, not
+             * g_client: ES keeps `client` valid for the full duration of this
+             * callback and es_delete_client blocks until in-flight callbacks
+             * return, so `client` cannot be freed under us — and we must ALWAYS
+             * respond (never skip), or the kernel silently ALLOWs at the deadline
+             * and defeats a fail-closed AUTH client. */
+            es_respond_auth_result(client, msg, ES_AUTH_RESULT_ALLOW, false);
             os_unfair_lock_unlock(&g_teardown_lock);
             free(ctx);
             break;
@@ -865,7 +861,7 @@ static void handle_event(es_client_t *client __attribute__((unused)),
              * higher-volume than execs, so failing closed here would freeze
              * the system under memory pressure. The sensitive-path fail-closed
              * guarantee applies to the deadline path, not this OOM path. */
-            es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+            es_respond_auth_result(client, msg, ES_AUTH_RESULT_ALLOW, false);
             break;
         }
 
@@ -877,9 +873,8 @@ static void handle_event(es_client_t *client __attribute__((unused)),
 
         os_unfair_lock_lock(&g_teardown_lock);
         if (atomic_load(&g_stop)) {
-            /* Respond INSIDE the lock, NULL-guarded — see AUTH_EXEC note above. */
-            if (g_client)
-                es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+            /* Always respond via the live `client` argument — see AUTH_EXEC note. */
+            es_respond_auth_result(client, msg, ES_AUTH_RESULT_ALLOW, false);
             os_unfair_lock_unlock(&g_teardown_lock);
             free(ctx);
             break;

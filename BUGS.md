@@ -16,6 +16,7 @@ Audit findings and fixes across all chapters.
 - Round 13: adversarial cross-chapter audit (5 cross-cutting lenses × 16 files, each finding adversarially verified) — 7 findings (`16` ×4, `13`/`14`, `10`); recurring theme: ch16 capstone reimplemented subsystems and dropped hardening the standalone chapters received in rounds 10–12. ch01/02/04/05/06/07/08/11/12/15 clean for all lenses
 - Round 14: Codex review of the round-13 patch (`--base cc192b9`) — 4 findings (`16` ×3, `10`); all were incomplete/regressive round-13 fixes: the B68 inline-response left the lock too early, the B73 deadline-deny dropped the write/platform predicates, the B72 OOM cleanup lacked the token-equality guard, and the B74 dedup key was truncated below the URL divergence point
 - Round 15: Codex review of the round-14 patch (`--base 1ac4d21`) — 2 findings (`16`, `10`); both were round-14 fixes that only narrowed the defect: B75 moved the AUTH response inside the lock but `do_shutdown` still deleted `g_client` outside it, and B78 widened the dedup key buffer but a fixed buffer still has a truncation threshold
+- Round 16: Codex review of the round-15 patch (`--base bdf7a65`) — 2 findings (`16`, `10`); B79's NULL-guard could skip the AUTH response entirely (silent kernel ALLOW on a fail-closed client), and B80's alloc-after-evict could discard a valid pending install on OOM with nothing to replace it
 
 ---
 
@@ -857,3 +858,23 @@ B75 moved the inline AUTH response inside `g_teardown_lock`, but `do_shutdown` r
 B78 widened the key buffer to 4096 bytes, but `copy_str_token` still truncates any `item_url` of ≥4096 bytes — distinct URLs sharing that prefix still collapse into one slot, moving rather than removing the collision threshold.
 
 **Fix:** Key on the **full token** with no fixed buffer: store a `malloc`'d copy of the exact `item_url` bytes plus its byte length, and match with length+`memcmp` (`key_eq`). `pending_add`/`pending_remove` now take `(const char *bytes, size_t len)` straight from `item->item_url`, and slots are freed with `slot_clear`. The 512-byte `plist_buf` locals are retained for logging only. No truncation threshold exists.
+
+## Round 16 — Codex review of the round-15 patch
+
+Codex reviewed the round-15 diff against `bdf7a65`. Both findings were edge-case defects introduced by the round-15 fixes.
+
+### B81: unified-agent inline AUTH response could be skipped during shutdown (B79 side effect)
+**Severity:** High
+**Location:** `16-unified-agent/unified-agent.c`, AUTH_EXEC / AUTH_OPEN inline-response branches
+
+B79 NULL-guarded the inline response (`if (g_client) es_respond_auth_result(g_client, …)`) so a handler that acquired the teardown lock only after `do_shutdown` had already deleted the client would skip the response. Skipping leaves the operation unanswered — the kernel applies its deadline default of **ALLOW**, silently defeating a fail-closed AUTH client at shutdown.
+
+**Fix:** Respond unconditionally via the handler's `client` argument (not `g_client`). ES keeps `client` valid for the entire callback, and `es_delete_client` blocks until in-flight callbacks return, so a handler that is mid-callback always responds against a live client before deletion can complete — no NULL-skip needed. The AUTH OOM responses were switched to `client` for the same guarantee.
+
+### B82: persistence pending_add evicted a valid slot before a possibly-failing malloc (B80 side effect)
+**Severity:** Low
+**Location:** `10-persistence/persistence.c`, `pending_add()`
+
+B80's full-token key allocated the copy **after** selecting and `slot_clear`-ing the eviction victim. If `malloc` then failed, a valid pending install had already been discarded with no replacement — a later REMOVE for that item would miss the Rule-3 alert.
+
+**Fix:** `malloc`+`memcpy` the replacement first; only choose and clear a victim slot once the allocation has succeeded. On OOM the ADD is dropped and all existing entries stay intact.
