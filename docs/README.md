@@ -31,6 +31,7 @@ Chapter-by-chapter notes for the macOS [Endpoint Security](https://developer.app
 
 | Document | Contents |
 |---|---|
+| [es-api-invariants.md](es-api-invariants.md) | Canonical list of ES API correctness invariants accumulated across all audit rounds (see `BUGS.md` for the findings behind each) |
 | [ebpf101-mapping.md](ebpf101-mapping.md) | Complete mapping of all 23 ebpf101 chapters to ES equivalents; divergence analysis |
 
 ---
