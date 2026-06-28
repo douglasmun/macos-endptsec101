@@ -13,6 +13,7 @@ Audit findings and fixes across all chapters.
 - Round 10: `15-deferred-auth`, `13-auth-open` — 3 findings
 - Round 11: deep re-audit of `01-hello-exec` through `08-ancestry` — 3 findings (`03-auth-exec`, `08-ancestry` ×2); ch01/02/04/05/06/07 clean
 - Round 12: deep re-audit of `09-tcc` through `16-unified-agent` — 7 findings (`16` ×2, `15`, `09`, `10`, `12` ×2); ch11/13/14 clean
+- Round 13: adversarial cross-chapter audit (5 cross-cutting lenses × 16 files, each finding adversarially verified) — 7 findings (`16` ×4, `13`/`14`, `10`); recurring theme: ch16 capstone reimplemented subsystems and dropped hardening the standalone chapters received in rounds 10–12. ch01/02/04/05/06/07/08/11/12/15 clean for all lenses
 
 ---
 
@@ -724,3 +725,77 @@ Both parse loops use `fgets(line, MAX_PATH_LEN, f)`. A config line longer than `
 Every other status print in the file flushes stdout, but `printf("[CONFIG] initial load: %d paths\n", loaded)` did not. On a pipe/non-TTY stdout it could be buffered and reordered after later flushed output, or lost on kill.
 
 **Fix:** Added `fflush(stdout)` after the line.
+
+---
+
+## Round 13 — adversarial cross-chapter audit
+
+Five cross-cutting lenses (replicated-pattern divergence, concurrency/TOCTOU, untrusted string-token handling, AUTH completeness / fail-open, cross-event state lifecycle) fanned out across all 16 files; every raw finding was then run through an independent refute-by-default verifier. 11 confirmed, 6 refuted, deduplicated to 7 distinct issues. No criticals. Recurring theme: the ch16 capstone reimplemented each subsystem independently and never received the hardening the standalone chapters got in rounds 10–12 (B45/B59/B60/B64).
+
+### B68: unified-agent deferred-AUTH shutdown UAF — handler can enqueue a worker after the barrier drained
+**Severity:** Medium
+**Location:** `16-unified-agent/unified-agent.c`, `handle_event()` AUTH_EXEC/AUTH_OPEN cases + `do_shutdown()`
+
+The `g_stop` gate was read *before* `es_retain_message` + `dispatch_async`, not atomically with it. A handler that passed the gate while `g_stop==0` could lose the race to `do_shutdown` (`es_unsubscribe_all` → `dispatch_barrier_sync` → `es_delete_client`) and then enqueue a worker *after* the barrier had already drained. That worker called `es_respond_auth_result(g_client, …)` / `es_release_message` on a freed/NULL client. The in-code comment claiming the gate covered this overstated it — the barrier only waits for blocks enqueued before it.
+
+**Fix:** Added `g_teardown_lock` (`os_unfair_lock`). Both AUTH cases now check `g_stop`, retain, and `dispatch_async` while holding the lock; if `g_stop` is set they respond inline (ALLOW) and free the ctx. `do_shutdown` holds the same lock across `es_unsubscribe_all`, so any handler mid-enqueue either completed before teardown (its worker drained by the barrier) or observes `g_stop==1` under the lock and never dispatches.
+
+---
+
+### B69: unified-agent NULL-`executable` dereference across FORK/EXEC/CS_INVALIDATED/AUTH_EXEC (regression of B60/B64)
+**Severity:** Medium
+**Location:** `16-unified-agent/unified-agent.c` — NOTIFY_FORK, NOTIFY_EXEC, NOTIFY_CS_INVALIDATED, AUTH_EXEC evaluator, `print_path`
+
+`es_process_t.executable` may be NULL. Multiple sites formed `&proc->executable->path` (dereferencing `executable` in the argument expression, before `copy_str_token`'s internal token guard), plus the CS_INVALIDATED handler and AUTH_EXEC evaluator dereferenced `executable->path` inline with no guard, and `print_path` lacked the NULL-`file` guard ch09 got in B64. ch08 fixed this exact class with `copy_exec_path()` (B60); ch16 had neither that helper nor the NULL-safe `print_path`. A NULL `executable` would crash the entire unified client, taking down all subscribed streams including the AUTH verdict path.
+
+**Fix:** Ported `copy_exec_path(buf, bufsz, proc)` (guards `proc && proc->executable`) and routed all FORK/EXEC/CS_INVALIDATED path copies through it; the AUTH_EXEC evaluator now snapshots `exe_path` behind an `exe ? … : empty` guard; `print_path` prints `(unknown)` for a NULL file.
+
+---
+
+### B70: auth-open (ch13) + cs-invalidated (ch14) NULL-`executable` deref + non-NULL-safe `copy_str_token` (B64 never back-ported)
+**Severity:** Medium
+**Location:** `13-auth-open/auth-open.c` (`copy_str_token`, `is_browser_process`, sensitive-write log) and `14-cs-invalidated/cs-invalidated.c` (`copy_str_token`, CS_INVALIDATED + EXEC handlers)
+
+Both chapters' `copy_str_token` omitted the `!tok->data || tok->length==0` guard present in ch07/ch08/ch09/ch16, and both dereferenced `proc->executable` / `target->executable` with no NULL check. ch13's crash is the more serious: a NULL `executable` on the sensitive-write branch crashes the AUTH_OPEN enforcer *before* `es_respond_auth_result` runs → kernel default ALLOW → the sensitive write it meant to deny is permitted, and the client is dead for all later events. Round 12 marked ch13/ch14 "clean" but never covered executable derefs — same class as B60/B64.
+
+**Fix:** Added the `!tok || !tok->data || !tok->length` guard to both `copy_str_token`s and a guarded `copy_exec_path` helper to each; routed every executable-path copy through it.
+
+---
+
+### B71: unified-agent self-mute failure downgraded to non-fatal warning (diverges from ch10/ch14/ch15)
+**Severity:** Medium
+**Location:** `16-unified-agent/unified-agent.c`, `main()`
+
+On `task_info` or `es_mute_process` failure, ch16 logged a warning and fell through unconditionally to `es_subscribe`. Self-mute is the capstone's only self-protection; unmuted, its own opens/execs re-enter the handler and — because it runs the ch15 deferred-AUTH model on AUTH_EXEC/AUTH_OPEN — its own activity gets authorization-evaluated and dispatched to workers, amplifying the feedback-loop / self-deadlock surface. ch10, ch14, and ch15 all abort on this; ch16 alone continued.
+
+**Fix:** Both failure paths now `fprintf(stderr, …); es_delete_client(g_client); return 1;`, matching the siblings.
+
+---
+
+### B72: unified-agent tree-OOM early `break` leaks the pre-exec IDS state entry
+**Severity:** Medium
+**Location:** `16-unified-agent/unified-agent.c`, NOTIFY_EXEC handler
+
+When `tree_get_or_create()` returned NULL (calloc failure), the handler removed only the tree node and `break`ed, never reaching the IDS-state migration block below — so `state_remove(pre-exec token)` never ran. The pre-exec `proc_state_t` (created by a prior NOTIFY_WRITE/UIPC_CONNECT) leaked forever, since NOTIFY_EXIT only delivers the post-exec token. The "always remove regardless of alloc success" invariant was honored *within* the state block but defeated by the earlier tree-OOM short-circuit — exactly the cross-table coupling a single-table audit misses.
+
+**Fix:** The tree-OOM path now also runs `if (state_find(pre)) state_remove(pre)` before breaking, cleaning both tables.
+
+---
+
+### B73: unified-agent AUTH_OPEN fail-direction asymmetry — sensitive write allowed under deadline pressure
+**Severity:** Low
+**Location:** `16-unified-agent/unified-agent.c`, `evaluate_open_and_respond()` deadline-miss path
+
+AUTH_OPEN failed open (ALLOW) on a deadline miss while sibling AUTH_EXEC failed closed (DENY). An attacker could defeat the sensitive-write rule by driving the work queue into backlog so every AUTH_OPEN — including an unsigned process's write to `/etc/sudoers` — resolved ALLOW. (The verifier corrected the original medium→low and confirmed the *shutdown* path is symmetric — both event types ALLOW on `g_stop` — so only the deadline path was asymmetric.)
+
+**Fix:** The AUTH_OPEN deadline-miss path now copies the path and DENYs if it is a sensitive path, ALLOWs otherwise — matching AUTH_EXEC's fail-closed posture for the paths the rule protects. The handler-level OOM path remains fail-open (documented: opens are far higher-volume than execs; failing closed there would freeze the system under memory pressure).
+
+---
+
+### B74: persistence (ch10) pending-install table allows duplicate `item_url` entries
+**Severity:** Low
+**Location:** `10-persistence/persistence.c`, `pending_add()`
+
+`pending_add` took the first empty slot with no key dedup, and Rule 3 calls it on every BTM ADD. A repeated ADD of the same `item_url` (installer rewriting a LaunchAgent plist) created duplicate slots; `pending_remove` cleared only the first, so duplicates persisted and the oldest-by-`install_time` eviction could discard a genuinely distinct pending item before its REMOVE arrived, suppressing the Rule-3 "execute-once-cleanup" alert. This logic lives only in ch10 (ch16 dropped Rule 3) and was never re-reviewed.
+
+**Fix:** `pending_add` now first scans for an existing slot with a matching `exec_path` and refreshes its `install_time` in place instead of allocating a second slot.

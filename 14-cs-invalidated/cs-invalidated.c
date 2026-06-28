@@ -88,9 +88,19 @@ static void inv_remove(const audit_token_t *token) {
 }
 
 static void copy_str_token(char *dst, size_t dsz, const es_string_token_t *tok) {
+    if (!tok || !tok->data || tok->length == 0) { dst[0] = '\0'; return; }
     size_t len = tok->length < dsz - 1 ? tok->length : dsz - 1;
     memcpy(dst, tok->data, len);
     dst[len] = '\0';
+}
+
+/* Copy a process's executable path into a fixed buffer, guarding both a NULL
+ * executable and a truncated path. */
+static void copy_exec_path(char *dst, size_t dsz, const es_process_t *proc) {
+    if (!proc || !proc->executable) { strlcpy(dst, "(unknown)", dsz); return; }
+    copy_str_token(dst, dsz, &proc->executable->path);
+    if (proc->executable->path_truncated)
+        strlcat(dst, "...(truncated)", dsz);
 }
 
 static dispatch_queue_t g_main_queue;
@@ -118,12 +128,8 @@ static void handle_event(es_client_t *client, const es_message_t *msg) {
         pid_t pid = audit_token_to_pid(*tok);
         uint32_t flags = msg->process->codesigning_flags;
         int platform = msg->process->is_platform_binary;
-        const es_file_t *exe = msg->process->executable;
         char path[512];
-        copy_str_token(path, sizeof(path), &exe->path);
-        /* Append truncation marker so alerts are not silently incomplete */
-        if (exe->path_truncated)
-            strlcat(path, "...(truncated)", sizeof(path));
+        copy_exec_path(path, sizeof(path), msg->process);
 
         fprintf(stderr, "[ALERT] cs-invalidated: pid=%d path=%s flags=0x%x\n",
                 pid, path, flags);
@@ -145,11 +151,8 @@ static void handle_event(es_client_t *client, const es_message_t *msg) {
         const audit_token_t *old_tok = &msg->process->audit_token;
 
         if (inv_lookup(old_tok)) {
-            const es_file_t *exe = target->executable;
             char path[512];
-            copy_str_token(path, sizeof(path), &exe->path);
-            if (exe->path_truncated)
-                strlcat(path, "...(truncated)", sizeof(path));
+            copy_exec_path(path, sizeof(path), target);
             fprintf(stderr, "[ALERT] invalidated-process-exec: pid=%d new-path=%s\n",
                     pid, path);
             fflush(stderr);

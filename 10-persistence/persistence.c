@@ -71,6 +71,18 @@ static const char *btm_type_str(es_btm_item_type_t t)
 static void pending_add(const char *exec_path)
 {
     time_t now = time(NULL);
+    /* Dedup on key first: a repeated ADD of the same item_url (installer
+     * rewriting a plist) must refresh the existing slot, not allocate a second.
+     * Without this, duplicates accumulate — a single REMOVE clears only the
+     * first, and oldest-by-install_time eviction can discard a distinct pending
+     * item before its REMOVE arrives, suppressing the Rule-3 alert. */
+    for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
+        if (g_pending[i].exec_path[0] != '\0' &&
+            strcmp(g_pending[i].exec_path, exec_path) == 0) {
+            g_pending[i].install_time = now;
+            return;
+        }
+    }
     for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
         if (g_pending[i].exec_path[0] == '\0') {
             strlcpy(g_pending[i].exec_path, exec_path, sizeof(g_pending[i].exec_path));

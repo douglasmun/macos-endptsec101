@@ -14,9 +14,17 @@ static atomic_int        g_running    = 1;
 
 static void copy_str_token(char *dst, size_t dstsz, const es_string_token_t *tok)
 {
+    if (!tok || !tok->data || tok->length == 0) { dst[0] = '\0'; return; }
     size_t n = tok->length < dstsz - 1 ? tok->length : dstsz - 1;
     memcpy(dst, tok->data, n);
     dst[n] = '\0';
+}
+
+/* Copy a process's executable path, guarding proc->executable being NULL. */
+static void copy_exec_path(char *dst, size_t dstsz, const es_process_t *proc)
+{
+    if (!proc || !proc->executable) { dst[0] = '\0'; return; }
+    copy_str_token(dst, dstsz, &proc->executable->path);
 }
 
 static const char *g_sensitive_paths[] = {
@@ -57,7 +65,7 @@ static int path_is_sensitive(const es_file_t *file)
 static int is_browser_process(const es_process_t *proc)
 {
     char buf[512];
-    copy_str_token(buf, sizeof(buf), &proc->executable->path);
+    copy_exec_path(buf, sizeof(buf), proc);
     static const char *browsers[] = { "Safari", "firefox", "Chrome", "Chromium", "Brave", NULL };
     for (int i = 0; browsers[i]; i++)
         if (strstr(buf, browsers[i])) return 1;
@@ -93,7 +101,7 @@ static void handle_auth_open(es_client_t *client, const es_message_t *msg)
     copy_str_token(filepath, sizeof(filepath), &file->path);
 
     char procpath[512];
-    copy_str_token(procpath, sizeof(procpath), &proc->executable->path);
+    copy_exec_path(procpath, sizeof(procpath), proc);
 
     pid_t pid = audit_token_to_pid(proc->audit_token);
 

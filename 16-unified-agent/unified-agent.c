@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <os/lock.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -197,6 +198,12 @@ static dispatch_queue_t    g_work_queue = NULL;
 static atomic_int          g_stop       = 0;
 static uint64_t            g_ticks_per_ms = 0;
 
+/* Serializes AUTH worker enqueue (handle_event) against client teardown
+ * (do_shutdown). Without it, a handler that reads g_stop==0 can dispatch a
+ * worker after do_shutdown's barrier has drained and the client is freed —
+ * the worker then touches a freed client (use-after-free). */
+static os_unfair_lock      g_teardown_lock = OS_UNFAIR_LOCK_INIT;
+
 static _Atomic uint64_t    g_total_evals    = 0;
 static _Atomic uint64_t    g_deadline_misses = 0;
 
@@ -227,9 +234,17 @@ static void copy_str_token(char *buf, size_t bufsz, const es_string_token_t *s)
 
 static void print_path(const es_file_t *file)
 {
+    if (!file) { printf("(unknown)"); return; }
     printf("%.*s", (int)file->path.length, file->path.data);
     if (file->path_truncated)
         printf("...(truncated)");
+}
+
+/* Copy a process's executable path, guarding proc->executable being NULL. */
+static void copy_exec_path(char *buf, size_t bufsz, const es_process_t *proc)
+{
+    if (!proc || !proc->executable) { buf[0] = '\0'; return; }
+    copy_str_token(buf, bufsz, &proc->executable->path);
 }
 
 static const char *leaf(const char *path)
@@ -373,10 +388,17 @@ static void do_shutdown(void *ctx __attribute__((unused)))
     /* Unsubscribe before draining: the barrier waits only for workers already
      * enqueued. With the client still subscribed during the barrier, a new
      * AUTH event could enqueue a worker afterward that touches a freed client.
-     * Unsubscribe stops new deliveries; the g_stop gate in handle_event covers
-     * the in-flight-callback race; then the barrier drains; then we delete. */
+     *
+     * The teardown lock closes the in-flight-callback race that g_stop alone
+     * cannot: a handler that already read g_stop==0 must not be able to enqueue
+     * a worker after this barrier. Holding the lock across unsubscribe ensures
+     * any handler mid-enqueue either completed before us (its worker is then
+     * drained by the barrier) or will observe g_stop==1 under the lock and
+     * respond inline without dispatching. */
+    os_unfair_lock_lock(&g_teardown_lock);
     if (g_client)
         es_unsubscribe_all(g_client);
+    os_unfair_lock_unlock(&g_teardown_lock);
     dispatch_barrier_sync(g_work_queue, ^{});
     if (g_client) {
         es_delete_client(g_client);
@@ -415,7 +437,9 @@ static void evaluate_exec_and_respond(auth_ctx_t *ctx)
     const es_process_t *target = msg->event.exec.target;
     pid_t pid = audit_token_to_pid(target->audit_token);
     const es_file_t *exe = target->executable;
-    const char *trunc = exe->path_truncated ? "...(truncated)" : "";
+    es_string_token_t exe_path = exe ? exe->path
+                                     : (es_string_token_t){ .length = 0, .data = "" };
+    const char *trunc = (exe && exe->path_truncated) ? "...(truncated)" : "";
 
     uint64_t now      = mach_absolute_time();
     uint64_t deadline = msg->deadline;
@@ -433,7 +457,7 @@ static void evaluate_exec_and_respond(auth_ctx_t *ctx)
     /* Platform binary: fast-allow */
     if (target->is_platform_binary) {
         printf("[AUTH-EXEC] verdict=ALLOW pid=%d path=%.*s%s (platform)\n",
-               pid, (int)exe->path.length, exe->path.data, trunc);
+               pid, (int)exe_path.length, exe_path.data, trunc);
         fflush(stdout);
         es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
         es_release_message(msg);
@@ -444,10 +468,10 @@ static void evaluate_exec_and_respond(auth_ctx_t *ctx)
     if (ctx->cs_invalidated) {
         fprintf(stderr,
                 "[ALERT] AUTH_EXEC DENY: cs_invalidated pid=%d path=%.*s%s ancestry=%s\n",
-                pid, (int)exe->path.length, exe->path.data, trunc, ctx->ancestry);
+                pid, (int)exe_path.length, exe_path.data, trunc, ctx->ancestry);
         fflush(stderr);
         printf("[AUTH-EXEC] verdict=DENY pid=%d path=%.*s%s (cs_invalidated)\n",
-               pid, (int)exe->path.length, exe->path.data, trunc);
+               pid, (int)exe_path.length, exe_path.data, trunc);
         fflush(stdout);
         es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_DENY, false);
         es_release_message(msg);
@@ -458,10 +482,10 @@ static void evaluate_exec_and_respond(auth_ctx_t *ctx)
     if (target->codesigning_flags & CS_DEBUGGED) {
         fprintf(stderr,
                 "[ALERT] AUTH_EXEC DENY: CS_DEBUGGED pid=%d path=%.*s%s ancestry=%s\n",
-                pid, (int)exe->path.length, exe->path.data, trunc, ctx->ancestry);
+                pid, (int)exe_path.length, exe_path.data, trunc, ctx->ancestry);
         fflush(stderr);
         printf("[AUTH-EXEC] verdict=DENY pid=%d path=%.*s%s (CS_DEBUGGED)\n",
-               pid, (int)exe->path.length, exe->path.data, trunc);
+               pid, (int)exe_path.length, exe_path.data, trunc);
         fflush(stdout);
         es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_DENY, false);
         es_release_message(msg);
@@ -469,7 +493,7 @@ static void evaluate_exec_and_respond(auth_ctx_t *ctx)
     }
 
     printf("[AUTH-EXEC] verdict=ALLOW pid=%d path=%.*s%s ancestry=%s\n",
-           pid, (int)exe->path.length, exe->path.data, trunc, ctx->ancestry);
+           pid, (int)exe_path.length, exe_path.data, trunc, ctx->ancestry);
     fflush(stdout);
     es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
     es_release_message(msg);
@@ -492,9 +516,19 @@ static void evaluate_open_and_respond(auth_ctx_t *ctx)
     if (now >= deadline ||
         (deadline - now) < MIN_WORK_BUDGET_MS * g_ticks_per_ms) {
         atomic_fetch_add(&g_deadline_misses, 1);
-        fprintf(stderr, "[WARN] deadline-miss AUTH_OPEN pid=%d — allowing\n", pid);
+        /* Fail closed for sensitive paths to match AUTH_EXEC's fail-closed
+         * deadline behavior — otherwise an attacker could defeat the
+         * sensitive-write rule by driving the work queue into backlog. Other
+         * opens still fail open (monitoring-leaning default for the common case). */
+        char dpath[PATH_BUF];
+        copy_str_token(dpath, sizeof(dpath), &file->path);
+        es_auth_result_t verdict = is_sensitive_path(dpath)
+                                   ? ES_AUTH_RESULT_DENY : ES_AUTH_RESULT_ALLOW;
+        fprintf(stderr, "[WARN] deadline-miss AUTH_OPEN pid=%d path=%s — %s\n",
+                pid, dpath,
+                verdict == ES_AUTH_RESULT_DENY ? "denying" : "allowing");
         fflush(stderr);
-        es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+        es_respond_auth_result(g_client, msg, verdict, false);
         es_release_message(msg);
         return;
     }
@@ -558,7 +592,7 @@ static void handle_event(es_client_t *client __attribute__((unused)),
         if (!n) break;
 
         n->parent_token = msg->process->audit_token;
-        copy_str_token(n->path, PATH_BUF, &msg->process->executable->path);
+        copy_exec_path(n->path, PATH_BUF, msg->process);
         break;
     }
 
@@ -571,10 +605,14 @@ static void handle_event(es_client_t *client __attribute__((unused)),
         tree_node_t *old = tree_find(&msg->process->audit_token);
         tree_node_t *n   = tree_get_or_create(&target->audit_token, pid);
         if (!n) {
-            /* OOM: remove stale pre-exec entry so it doesn't leak.
-             * EXIT delivers the final image token; this pre-exec token
-             * would never be cleaned up otherwise. */
+            /* OOM: remove stale pre-exec entries so they don't leak.
+             * EXIT delivers the final image token; these pre-exec tokens
+             * would never be cleaned up otherwise. Clean BOTH tables here —
+             * the IDS-state migration block below is skipped by this break,
+             * so its state_remove never runs without this. */
             if (old) tree_remove(&msg->process->audit_token);
+            if (state_find(&msg->process->audit_token))
+                state_remove(&msg->process->audit_token);
             break;
         }
 
@@ -585,7 +623,7 @@ static void handle_event(es_client_t *client __attribute__((unused)),
         } else {
             n->parent_token = target->parent_audit_token;
         }
-        copy_str_token(n->path, PATH_BUF, &target->executable->path);
+        copy_exec_path(n->path, PATH_BUF, target);
 
         /* ── IDS state migration ── */
         proc_state_t *old_s = state_find(&msg->process->audit_token);
@@ -604,7 +642,7 @@ static void handle_event(es_client_t *client __attribute__((unused)),
             state_remove(&msg->process->audit_token);
         }
         if (s) {
-            copy_str_token(s->path, PATH_BUF, &target->executable->path);
+            copy_exec_path(s->path, PATH_BUF, target);
             rule_exec_chain(s);
             rule_sensitive_file_write(s);
         }
@@ -748,28 +786,18 @@ static void handle_event(es_client_t *client __attribute__((unused)),
         tree_node_t *n = tree_find(&msg->process->audit_token);
         if (n) n->cs_invalidated = 1;
 
-        fprintf(stderr,
-                "[ALERT] CS_INVALIDATED pid=%d path=%.*s\n",
-                pid,
-                (int)msg->process->executable->path.length,
-                msg->process->executable->path.data);
+        char cs_path[PATH_BUF];
+        copy_exec_path(cs_path, sizeof(cs_path), msg->process);
+
+        fprintf(stderr, "[ALERT] CS_INVALIDATED pid=%d path=%s\n", pid, cs_path);
         fflush(stderr);
-        printf("[CS-INVALIDATED] pid=%d path=%.*s\n",
-               pid,
-               (int)msg->process->executable->path.length,
-               msg->process->executable->path.data);
+        printf("[CS-INVALIDATED] pid=%d path=%s\n", pid, cs_path);
         fflush(stdout);
         break;
     }
 
     /* ── AUTH_EXEC ──────────────────────────────────────────────────────── */
     case ES_EVENT_TYPE_AUTH_EXEC: {
-        /* Shutdown started: don't enqueue a worker that could outlive the
-         * client. Respond ALLOW inline so the kernel isn't left waiting. */
-        if (atomic_load(&g_stop)) {
-            es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
-            break;
-        }
         auth_ctx_t *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
             /* Allocation failure: deny conservatively */
@@ -784,24 +812,33 @@ static void handle_event(es_client_t *client __attribute__((unused)),
             ctx->cs_invalidated = n->cs_invalidated;
         }
 
+        /* Check g_stop and enqueue under the teardown lock so this cannot race
+         * do_shutdown's barrier+delete. If shutdown began, respond inline. */
+        os_unfair_lock_lock(&g_teardown_lock);
+        if (atomic_load(&g_stop)) {
+            os_unfair_lock_unlock(&g_teardown_lock);
+            es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+            free(ctx);
+            break;
+        }
         es_retain_message(msg);
         ctx->msg = (es_message_t *)(uintptr_t)msg;
-
         dispatch_async(g_work_queue, ^{
             evaluate_exec_and_respond(ctx);
             free(ctx);
         });
+        os_unfair_lock_unlock(&g_teardown_lock);
         break;
     }
 
     /* ── AUTH_OPEN ──────────────────────────────────────────────────────── */
     case ES_EVENT_TYPE_AUTH_OPEN: {
-        if (atomic_load(&g_stop)) {
-            es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
-            break;
-        }
         auth_ctx_t *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
+            /* Cannot evaluate without a context; fail open. Opens are far
+             * higher-volume than execs, so failing closed here would freeze
+             * the system under memory pressure. The sensitive-path fail-closed
+             * guarantee applies to the deadline path, not this OOM path. */
             es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
             break;
         }
@@ -812,13 +849,20 @@ static void handle_event(es_client_t *client __attribute__((unused)),
             ctx->cs_invalidated = n->cs_invalidated;
         }
 
+        os_unfair_lock_lock(&g_teardown_lock);
+        if (atomic_load(&g_stop)) {
+            os_unfair_lock_unlock(&g_teardown_lock);
+            es_respond_auth_result(g_client, msg, ES_AUTH_RESULT_ALLOW, false);
+            free(ctx);
+            break;
+        }
         es_retain_message(msg);
         ctx->msg = (es_message_t *)(uintptr_t)msg;
-
         dispatch_async(g_work_queue, ^{
             evaluate_open_and_respond(ctx);
             free(ctx);
         });
+        os_unfair_lock_unlock(&g_teardown_lock);
         break;
     }
 
@@ -871,11 +915,18 @@ int main(void)
         audit_token_t self_token;
         mach_msg_type_number_t count = TASK_AUDIT_TOKEN_COUNT;
         if (task_info(mach_task_self(), TASK_AUDIT_TOKEN,
-                      (task_info_t)&self_token, &count) == KERN_SUCCESS) {
-            if (es_mute_process(g_client, &self_token) != ES_RETURN_SUCCESS)
-                fprintf(stderr, "warning: failed to mute self\n");
-        } else {
-            fprintf(stderr, "warning: task_info failed — could not mute self\n");
+                      (task_info_t)&self_token, &count) != KERN_SUCCESS) {
+            /* Self-mute is the only self-protection: unmuted, our own AUTH
+             * opens/execs re-enter the deferred-AUTH path. Treat as fatal,
+             * matching ch10/ch14/ch15. */
+            fprintf(stderr, "task_info failed — cannot self-mute, aborting\n");
+            es_delete_client(g_client);
+            return 1;
+        }
+        if (es_mute_process(g_client, &self_token) != ES_RETURN_SUCCESS) {
+            fprintf(stderr, "es_mute_process failed — cannot self-mute, aborting\n");
+            es_delete_client(g_client);
+            return 1;
         }
     }
 

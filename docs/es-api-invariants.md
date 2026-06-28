@@ -24,6 +24,23 @@ non-obvious traps the C ES API exposes; every chapter is expected to obey them.
   (`if (atomic_load(&g_stop)) { es_respond_auth_result(...ALLOW...); break; }`) so a
   callback already mid-flight when unsubscribe lands does not retain/dispatch a doomed
   worker — and the kernel is not left waiting.
+- Self-mute failure (`task_info` or `es_mute_process` returning non-success) is **fatal**,
+  not a warning, for any client that subscribes AUTH events or runs a deferred-AUTH work
+  queue. Self-mute is the only thing preventing the client's own activity from re-entering
+  its handler; unmuted, an AUTH client authorization-evaluates and dispatches workers for
+  its own opens/execs (feedback loop / self-deadlock). Abort: `es_delete_client; return 1`
+  — matching ch10/ch14/ch15 (Round 13 B71 fixed this in the ch16 capstone).
+- A bare `g_stop` flag check is **not sufficient** to close the shutdown enqueue race
+  (ch16). The flag is read *before* `es_retain_message` + `dispatch_async`, not atomically
+  with them, so a handler can pass the gate while `g_stop==0`, lose the race to
+  `do_shutdown` (unsubscribe → barrier → delete), and then enqueue a worker *after* the
+  barrier already drained — that worker touches a freed client. Serialize the
+  check-retain-dispatch against teardown with a lock: the AUTH handler takes
+  `g_teardown_lock` around `{ if (g_stop) respond inline; else retain + dispatch_async }`,
+  and `do_shutdown` holds the **same** lock across `es_unsubscribe_all`. Then a handler
+  mid-enqueue either finished before teardown (its worker is drained by the barrier) or
+  observes `g_stop==1` under the lock and never dispatches. Release the lock before the
+  barrier to avoid a lock-ordering deadlock with workers.
 
 ## AUTH vs NOTIFY responses
 
@@ -34,6 +51,13 @@ non-obvious traps the C ES API exposes; every chapter is expected to obey them.
   balanced on **every** code path through the evaluator, including the deadline-miss and
   OOM paths. `es_respond_auth_result` must also be called on every path — missing it on
   the deadline-miss path leaves the kernel waiting forever.
+- Fail direction must be **consistent across AUTH event types in the same client** for the
+  resources a rule protects (ch16). If AUTH_EXEC fails *closed* (DENY) on a deadline miss
+  but AUTH_OPEN fails *open* (ALLOW), an attacker defeats the AUTH_OPEN rule simply by
+  driving the work queue into backlog (Round 13 B73). For sensitive targets, fail closed
+  on the deadline path on *both* event types; a deliberate fail-open default (e.g. the
+  high-volume OOM path for opens, where failing closed would freeze the system) is
+  acceptable only if explicitly documented at the site.
 
 ## Message & field validity
 
@@ -46,7 +70,13 @@ non-obvious traps the C ES API exposes; every chapter is expected to obey them.
 - `es_process_t.executable` may be NULL — NULL-check before dereferencing
   `actor->executable->path` (e.g. ch09 TCC handlers). Helpers that take an `es_file_t *`
   (e.g. `print_path`) should also NULL-check their argument so a NULL executable cannot
-  crash the client.
+  crash the client. The guard must wrap the **dereference of `executable`**, not just the
+  token: writing `copy_str_token(buf, sz, &proc->executable->path)` already crashed in the
+  argument expression before the token guard runs. Use a `copy_exec_path(buf, sz, proc)`
+  helper that checks `proc && proc->executable` and route *every* executable-path copy
+  through it. This hardening must be applied uniformly — a fix landed in one chapter
+  (ch08 B60, ch09 B64) is a latent crash in every other chapter and in the ch16 capstone
+  until back-ported (Round 13 found it missing in ch13/ch14/ch16).
 - `team_id` and `signing_id` in `es_process_t` are `es_string_token_t` **values** (not
   pointers) — pass `&proc->team_id` when a pointer is expected.
 - `cdhash` in `es_process_t` is a `uint8_t[20]` — always print as hex (`%02x` loop),
@@ -97,6 +127,11 @@ non-obvious traps the C ES API exposes; every chapter is expected to obey them.
   exists, **regardless** of whether the new `state_get_or_create` / `tree_get_or_create`
   succeeded (e.g. on the OOM path). NOTIFY_EXIT only delivers the final image token —
   pre-exec tokens not explicitly removed leak permanently.
+- When a single NOTIFY_EXEC handler migrates **two** tables (ch16: tree + IDS state), an
+  early `break` on the first table's OOM path must still clean the **second** table's
+  pre-exec entry before breaking. The per-table "remove old regardless of alloc success"
+  rule is defeated if the tree-OOM short-circuit skips the state-migration block entirely
+  (Round 13 B72) — the state entry then leaks. Run both removals on the early-exit path.
 - When no FORK was observed for a process (it was already running at subscribe time),
   fall back to `target->parent_audit_token` from the EXEC event as the best available
   parent link.
