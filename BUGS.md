@@ -15,6 +15,7 @@ Audit findings and fixes across all chapters.
 - Round 12: deep re-audit of `09-tcc` through `16-unified-agent` — 7 findings (`16` ×2, `15`, `09`, `10`, `12` ×2); ch11/13/14 clean
 - Round 13: adversarial cross-chapter audit (5 cross-cutting lenses × 16 files, each finding adversarially verified) — 7 findings (`16` ×4, `13`/`14`, `10`); recurring theme: ch16 capstone reimplemented subsystems and dropped hardening the standalone chapters received in rounds 10–12. ch01/02/04/05/06/07/08/11/12/15 clean for all lenses
 - Round 14: Codex review of the round-13 patch (`--base cc192b9`) — 4 findings (`16` ×3, `10`); all were incomplete/regressive round-13 fixes: the B68 inline-response left the lock too early, the B73 deadline-deny dropped the write/platform predicates, the B72 OOM cleanup lacked the token-equality guard, and the B74 dedup key was truncated below the URL divergence point
+- Round 15: Codex review of the round-14 patch (`--base 1ac4d21`) — 2 findings (`16`, `10`); both were round-14 fixes that only narrowed the defect: B75 moved the AUTH response inside the lock but `do_shutdown` still deleted `g_client` outside it, and B78 widened the dedup key buffer but a fixed buffer still has a truncation threshold
 
 ---
 
@@ -835,4 +836,24 @@ B72 added a state-table cleanup to the tree-OOM `break` path, but called `state_
 
 B74 deduplicated on `exec_path`, but the key was a 512-byte truncated copy of `item_url`. Two distinct `item_url`s sharing their first 511 bytes (deep file:// paths, percent-encoding) collapsed into one slot; the first REMOVE cleared it and the second persistence removal was missed.
 
-**Fix:** Widen the key to `ITEM_URL_MAX` (4096) in the table struct and in both ADD/REMOVE `plist_buf` copies so distinct URLs are not collapsed by truncation before the `strcmp`.
+**Fix:** Widen the key to `ITEM_URL_MAX` (4096) in the table struct and in both ADD/REMOVE `plist_buf` copies so distinct URLs are not collapsed by truncation before the `strcmp`. *(Superseded by B80 — a fixed buffer of any size still has a threshold.)*
+
+## Round 15 — Codex review of the round-14 patch
+
+Codex reviewed the round-14 diff against `1ac4d21`. Both findings were round-14 fixes that only narrowed, rather than closed, the original defect.
+
+### B79: unified-agent client deletion still outside the teardown lock (B75 incomplete)
+**Severity:** High
+**Location:** `16-unified-agent/unified-agent.c`, `do_shutdown()` and both AUTH handler cases
+
+B75 moved the inline AUTH response inside `g_teardown_lock`, but `do_shutdown` released the lock after `es_unsubscribe_all` and performed the barrier + `es_delete_client` **outside** it. An AUTH callback already blocked on the lock during unsubscribe could acquire it *after* `do_shutdown` released it, then call `es_respond_auth_result(g_client, …)` while/after `es_delete_client` ran — the same use-after-free, merely on a narrower window.
+
+**Fix:** Hold `g_teardown_lock` across the **entire** teardown — `es_unsubscribe_all` → `dispatch_barrier_sync` → `es_delete_client` → `g_client = NULL`. The dispatched workers never take this lock, so holding it across the barrier cannot deadlock the drain. The inline-response branches now also NULL-check `g_client` under the lock, so a handler that acquires the lock only after teardown completed finds `g_client == NULL` and skips the response (the kernel ALLOWs at its own deadline) rather than dereferencing a freed client.
+
+### B80: persistence dedup key still has a fixed truncation threshold (B78 incomplete)
+**Severity:** Low
+**Location:** `10-persistence/persistence.c`, pending-install table
+
+B78 widened the key buffer to 4096 bytes, but `copy_str_token` still truncates any `item_url` of ≥4096 bytes — distinct URLs sharing that prefix still collapse into one slot, moving rather than removing the collision threshold.
+
+**Fix:** Key on the **full token** with no fixed buffer: store a `malloc`'d copy of the exact `item_url` bytes plus its byte length, and match with length+`memcmp` (`key_eq`). `pending_add`/`pending_remove` now take `(const char *bytes, size_t len)` straight from `item->item_url`, and slots are freed with `slot_clear`. The 512-byte `plist_buf` locals are retained for logging only. No truncation threshold exists.
