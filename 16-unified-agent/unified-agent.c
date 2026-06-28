@@ -389,23 +389,31 @@ static void do_shutdown(void *ctx __attribute__((unused)))
      * enqueued. With the client still subscribed during the barrier, a new
      * AUTH event could enqueue a worker afterward that touches a freed client.
      *
-     * The teardown lock closes the in-flight-callback enqueue race that g_stop
-     * alone cannot, and is held across the ENTIRE teardown — unsubscribe, drain,
-     * es_delete_client — so the inline-response branch and client deletion are
-     * mutually exclusive. The AUTH handler responds via its `client` argument,
-     * which ES keeps valid for the callback's duration; es_delete_client itself
-     * blocks until in-flight callbacks return, so a handler that is mid-callback
-     * always responds against a live client before this delete can complete.
-     * The dispatched workers (evaluate_*_and_respond) never take this lock, so
-     * holding it across the barrier cannot deadlock the drain. */
+     * The teardown lock is held ONLY across es_unsubscribe_all, NOT across the
+     * barrier/delete. Its sole job is to serialize against the AUTH handler's
+     * check-retain-dispatch: a handler that passed the g_stop gate (g_stop==0)
+     * holds the lock through es_retain_message + dispatch_async, so it finishes
+     * enqueuing before unsubscribe returns — its worker is then drained by the
+     * barrier. A handler that observes g_stop==1 under the lock responds inline
+     * via its `client` argument and dispatches nothing.
+     *
+     * The lock must NOT span es_delete_client: es_delete_client blocks until any
+     * in-flight callback returns, but a callback waiting on this lock cannot
+     * return until the lock is released — holding the lock across delete would
+     * deadlock. Releasing after unsubscribe is safe because the inline response
+     * uses the callback's live `client` (valid for the callback duration), and
+     * es_delete_client's own wait-for-callbacks guarantees the response lands on
+     * a live client even though deletion now runs outside the lock. */
     os_unfair_lock_lock(&g_teardown_lock);
-    if (g_client) {
-        es_unsubscribe_all(g_client);
+    es_client_t *client = g_client;
+    if (client)
+        es_unsubscribe_all(client);
+    os_unfair_lock_unlock(&g_teardown_lock);
+    if (client) {
         dispatch_barrier_sync(g_work_queue, ^{});
-        es_delete_client(g_client);
+        es_delete_client(client);
         g_client = NULL;
     }
-    os_unfair_lock_unlock(&g_teardown_lock);
     uint64_t total  = atomic_load(&g_total_evals);
     uint64_t misses = atomic_load(&g_deadline_misses);
     fprintf(stderr, "shutdown: evals=%llu deadline-misses=%llu\n",

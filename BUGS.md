@@ -17,6 +17,7 @@ Audit findings and fixes across all chapters.
 - Round 14: Codex review of the round-13 patch (`--base cc192b9`) — 4 findings (`16` ×3, `10`); all were incomplete/regressive round-13 fixes: the B68 inline-response left the lock too early, the B73 deadline-deny dropped the write/platform predicates, the B72 OOM cleanup lacked the token-equality guard, and the B74 dedup key was truncated below the URL divergence point
 - Round 15: Codex review of the round-14 patch (`--base 1ac4d21`) — 2 findings (`16`, `10`); both were round-14 fixes that only narrowed the defect: B75 moved the AUTH response inside the lock but `do_shutdown` still deleted `g_client` outside it, and B78 widened the dedup key buffer but a fixed buffer still has a truncation threshold
 - Round 16: Codex review of the round-15 patch (`--base bdf7a65`) — 2 findings (`16`, `10`); B79's NULL-guard could skip the AUTH response entirely (silent kernel ALLOW on a fail-closed client), and B80's alloc-after-evict could discard a valid pending install on OOM with nothing to replace it
+- Round 17: Codex review of the rounds 15+16 patch (`--base bdf7a65`) — 1 finding (`16`); B79's whole-teardown lock deadlocks shutdown when an AUTH callback waits on the same lock that `es_delete_client` (which blocks on that callback) is held across
 
 ---
 
@@ -878,3 +879,15 @@ B79 NULL-guarded the inline response (`if (g_client) es_respond_auth_result(g_cl
 B80's full-token key allocated the copy **after** selecting and `slot_clear`-ing the eviction victim. If `malloc` then failed, a valid pending install had already been discarded with no replacement — a later REMOVE for that item would miss the Rule-3 alert.
 
 **Fix:** `malloc`+`memcpy` the replacement first; only choose and clear a victim slot once the allocation has succeeded. On OOM the ADD is dropped and all existing entries stay intact.
+
+## Round 17 — Codex review of the rounds 15+16 patch
+
+Codex reviewed the combined rounds-15+16 diff against `bdf7a65`. One finding: the B79 whole-teardown lock is a shutdown deadlock.
+
+### B83: unified-agent teardown lock held across es_delete_client deadlocks shutdown (B79 side effect)
+**Severity:** High
+**Location:** `16-unified-agent/unified-agent.c`, `do_shutdown()`
+
+B79 held `g_teardown_lock` across the entire teardown — unsubscribe, barrier, **and** `es_delete_client`. But `es_delete_client` blocks until any in-flight handler callback returns, and an AUTH callback that is waiting to acquire `g_teardown_lock` cannot return until the lock is released — which `do_shutdown` only does *after* the delete. Classic lock-vs-join deadlock: shutdown waits for the callback, the callback waits for the lock.
+
+**Fix:** Hold the lock only across `es_unsubscribe_all`, then release it before the barrier/`es_delete_client` sequence. This is now safe because B81 made the inline AUTH response use the callback's live `client` argument (not `g_client`): `es_delete_client`'s own wait-for-in-flight-callbacks guarantees the inline response lands on a live client even though deletion runs outside the lock. The lock still serializes the handler's check-retain-dispatch against unsubscribe (so a normally-dispatched worker is always enqueued before the barrier), which was its only essential job.
