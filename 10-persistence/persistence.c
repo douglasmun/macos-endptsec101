@@ -184,13 +184,13 @@ static void handle_event(es_client_t *client, const es_message_t *msg)
         const es_process_t                      *ins  = ev->instigator;
         if (!ins) ins = msg->process;
 
-        char exec_buf[512]  = "(none)";
+        char app_buf[512]   = "(none)";
         char plist_buf[512] = "(none)";
         char ins_path[512]  = "(unknown)";
 
         /* BTM_REMOVE has no executable_path field — use item_url and app_url */
         if (item->app_url.length > 0)
-            copy_str_token(exec_buf, sizeof(exec_buf), &item->app_url);
+            copy_str_token(app_buf, sizeof(app_buf), &item->app_url);
         if (item->item_url.length > 0)
             copy_str_token(plist_buf, sizeof(plist_buf), &item->item_url);
         if (ins && ins->executable)
@@ -198,9 +198,9 @@ static void handle_event(es_client_t *client, const es_message_t *msg)
 
         pid_t pid = ins ? audit_token_to_pid(ins->audit_token) : -1;
 
-        printf("[BTM-REMOVE] type=%s exec=%s plist=%s pid=%d instigator=%s\n",
+        printf("[BTM-REMOVE] type=%s app=%s plist=%s pid=%d instigator=%s\n",
                btm_type_str(item->item_type),
-               exec_buf, plist_buf, pid, ins_path);
+               app_buf, plist_buf, pid, ins_path);
         fflush(stdout);
 
         /* Rule 3: install-then-remove within 60 s — keyed on item_url (plist_buf) */
@@ -210,8 +210,8 @@ static void handle_event(es_client_t *client, const es_message_t *msg)
                 time_t now = time(NULL);
                 fprintf(stderr,
                     "[ALERT] execute-once-cleanup: BTM item removed %lld s after install "
-                    "(plist=%s exec=%s, remover pid=%d %s)\n",
-                    (long long)(now - install_t), plist_buf, exec_buf, pid, ins_path);
+                    "(plist=%s app=%s, remover pid=%d %s)\n",
+                    (long long)(now - install_t), plist_buf, app_buf, pid, ins_path);
                 fflush(stderr);
             }
         }

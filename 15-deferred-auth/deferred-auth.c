@@ -13,6 +13,7 @@
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -151,6 +152,15 @@ static void do_shutdown(void *ctx)
            " deadline-misses=%" PRIu64 "\n",
            evals, misses);
     fflush(stdout);
+
+    /*
+     * Drain in-flight deferred AUTH workers before tearing down the client.
+     * Workers on the concurrent g_work_queue call es_respond_auth_result(g_client,
+     * ...) and es_release_message(); deleting the client while one is in flight is
+     * a use-after-free. The barrier waits for all queued/running blocks to finish.
+     */
+    if (g_work_queue)
+        dispatch_barrier_sync(g_work_queue, ^{});
 
     if (g_client) {
         es_unsubscribe_all(g_client);

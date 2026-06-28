@@ -150,8 +150,9 @@ static void do_shutdown(void *ctx)
 static void on_signal(int sig)
 {
     (void)sig;
-    atomic_store(&g_running, 0);
-    dispatch_async_f(g_main_queue, NULL, do_shutdown);
+    /* fire once: a second signal must not enqueue do_shutdown again */
+    if (atomic_exchange(&g_running, 0))
+        dispatch_async_f(g_main_queue, NULL, do_shutdown);
 }
 
 int main(void)

@@ -40,9 +40,12 @@ Documenting the gaps is as important as documenting what fires.
 
 ## New concepts introduced
 
-- **`es_event_btm_launch_item_add_t`**: carries the item type
-  (`ES_BTM_ITEM_TYPE_LAUNCH_AGENT`, `ES_BTM_ITEM_TYPE_LAUNCH_DAEMON`, etc.),
-  the plist URL, the executable URL, and the registering process.
+- **`es_event_btm_launch_item_add_t`**: carries the `item`
+  (`es_btm_launch_item_t`, whose `item_type` is `ES_BTM_ITEM_TYPE_AGENT`,
+  `ES_BTM_ITEM_TYPE_DAEMON`, `ES_BTM_ITEM_TYPE_LOGIN_ITEM`, etc.), the
+  optional `executable_path` from the launchd plist, and the optional
+  `instigator` / `app` registering processes. The REMOVE event has no
+  `executable_path` field.
 - **Combining signals**: a process that (1) arrived via a browser ancestry
   chain (ch08), (2) acquired microphone TCC access (ch09), and (3) installed a
   LaunchAgent (ch10) is a three-signal high-confidence malware indicator. Ch10
@@ -72,9 +75,12 @@ Documenting the gaps is as important as documenting what fires.
 ## Key ES API fields
 
 - `es_event_btm_launch_item_add_t.item` — the `es_btm_launch_item_t` descriptor
+- `es_event_btm_launch_item_add_t.executable_path` — POSIX exec path from the
+  plist (ADD only; relative paths are relative to `item->app_url`)
 - `es_btm_launch_item_t.item_type` — agent, daemon, login item, etc.
-- `es_btm_launch_item_t.executable_url` — path to the launched binary
-- `es_btm_launch_item_t.url` — path to the plist
+- `es_btm_launch_item_t.item_url` — URL for the item (plist)
+- `es_btm_launch_item_t.app_url` — optional URL for the app the item is
+  attributed to
 
 ## Relation to other chapters
 

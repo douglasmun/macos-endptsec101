@@ -8,6 +8,10 @@ Audit findings and fixes across all chapters.
 - Round 5: `07-ids`, `06-lsm-analog` — 2 findings
 - Round 6: `08-ancestry` — 4 findings
 - Round 7: `08-ancestry` — 2 findings
+- Round 8: `09-tcc` through `15-deferred-auth` — 14 findings
+- Round 9: `16-unified-agent` — 4 findings
+- Round 10: `15-deferred-auth`, `13-auth-open` — 3 findings
+- Round 11: deep re-audit of `01-hello-exec` through `08-ancestry` — 3 findings (`03-auth-exec`, `08-ancestry` ×2); ch01/02/04/05/06/07 clean
 
 ---
 
@@ -579,3 +583,69 @@ After the alert fired, `wrote_tmp` remained 1. Every subsequent exec by the same
 `if (!n) break` exited without removing the pre-exec tree entry when `tree_get_or_create` returned NULL. The old entry under `msg->process->audit_token` then leaked permanently.
 
 **Fix:** Added `if (old) tree_remove(&msg->process->audit_token)` before the `break` on the OOM path.
+
+---
+
+## Round 10 — ch13/ch15 audit
+
+### B55: deferred-auth use-after-free — client deleted while in-flight workers hold retained messages
+**Severity:** High
+**Location:** `15-deferred-auth/deferred-auth.c`, `do_shutdown()`
+
+`do_shutdown` called `es_unsubscribe_all(g_client)` + `es_delete_client(g_client)` without first draining the concurrent `g_work_queue`. The AUTH_EXEC handler retains each message and dispatches `evaluate_and_respond` onto that queue; the worker later calls `es_respond_auth_result(g_client, msg, ...)` and `es_release_message(msg)`. If a worker is in flight when the signal arrives, the client is freed out from under it — the worker then dereferences `g_client` and a kernel-side message that ES has already torn down (use-after-free). This is the exact failure ch16 already guards against (its `do_shutdown` drains via `dispatch_barrier_sync` per CLAUDE.md), making ch15 the outlier.
+
+**Fix:** Added `if (g_work_queue) dispatch_barrier_sync(g_work_queue, ^{});` before the client teardown. The barrier blocks until every queued and running block on the concurrent queue completes, so all retained messages are responded-to and released before `es_delete_client`.
+
+---
+
+### B56: deferred-auth uses PRIu64 without including <inttypes.h>
+**Severity:** Low
+**Location:** `15-deferred-auth/deferred-auth.c`, `do_shutdown()` shutdown-stats `printf`
+
+The shutdown line uses the `PRIu64` format macros (`evals=%" PRIu64 " deadline-misses=%" PRIu64`) but the file did not `#include <inttypes.h>`. It compiled only because `PRIu64` was pulled in transitively through other system headers — a latent portability bug that breaks if the transitive include path changes across SDK versions.
+
+**Fix:** Added `#include <inttypes.h>` to the include block (after `<mach/mach_time.h>`, before `<signal.h>`).
+
+---
+
+### B57: auth-open signal handler not fire-once — diverges from the project once-only pattern
+**Severity:** Nit
+**Location:** `13-auth-open/auth-open.c`, `on_signal()`
+
+`on_signal` unconditionally called `dispatch_async_f(g_main_queue, NULL, do_shutdown)` on every signal, unlike the other chapters which guard the dispatch behind a one-shot `atomic_exchange(&g_running, 0)` so a second Ctrl-C cannot enqueue `do_shutdown` twice. Not exploitable here (the main queue is serial, the first `do_shutdown` calls `exit(0)` before a second could run, and `do_shutdown` NULL-guards `g_client`), but fragile and inconsistent with the rest of the project.
+
+**Fix:** Wrapped the dispatch in `if (atomic_exchange(&g_running, 0))` so only the first signal enqueues `do_shutdown`. `g_running` already initializes to 1.
+
+---
+
+## Round 11 — deep re-audit of ch01–ch08
+
+Per-chapter deep audit of the eight earliest chapters against every CLAUDE.md invariant. `01-hello-exec`, `02-file-monitor`, `04-network`, `05-muting`, `06-lsm-analog`, and `07-ids` verified clean (state migration, flag resets, prefix-match separator logic, mute ordering, inversion type, per-path AUTH responses, snprintf guards, hash-table removal — all correct). Two findings:
+
+### B58: ancestry NOTIFY_EXEC OOM path leaks the stale pre-exec node
+**Severity:** Low
+**Location:** `08-ancestry/ancestry.c`, NOTIFY_EXEC handler — `if (!n) break;`
+
+`old = tree_find(&msg->process->audit_token)` captures the pre-exec node, then `tree_get_or_create(&target->audit_token, ...)` allocates the post-exec node. On OOM (`tree_get_or_create` returns NULL) the handler did `if (!n) break;` and returned without removing `old`. NOTIFY_EXIT only ever delivers the **post-exec** image token, so the pre-exec entry can never be reclaimed — it leaks permanently, and its stale `parent_token` can pollute later ancestry walks. This is the same class as B53/B54 (fixed in ch16) and directly violates the CLAUDE.md invariant: *"always call state_remove/tree_remove on the old pre-exec token when the old entry exists, regardless of whether the new get_or_create succeeded."* The invariant had been applied to ch07/ch16 but never to ch08.
+
+**Fix:** On the OOM path, remove the stale entry before bailing: `if (!n) { if (old) tree_remove(&msg->process->audit_token); break; }`. The `old != n` UAF guard is moot here since `n` is NULL.
+
+---
+
+### B59: auth-exec deny-list match ignores path_truncated — fail-open on AUTH enforcement path
+**Severity:** Low
+**Location:** `03-auth-exec/auth-exec.c`, `should_deny()`
+
+`should_deny` derives the binary's leaf name from the **end** of `target->executable->path` and compares it against the deny list, but never checked `path_truncated`. A truncated path has lost its trailing bytes — exactly the leaf name being matched — so the `memcmp` silently fails and the binary is allowed (fail-open). On an AUTH (enforcement) handler, an unmatchable path bypassing the deny list is the wrong default. ES executable paths effectively never truncate (PATH_MAX buffer), so the impact is theoretical, but the enforcement path should not fail open.
+
+**Fix:** Added an early `if (target->executable->path_truncated) return 1;` at the top of `should_deny` — an unmatchable path is treated as deny-worthy (fail-closed), consistent with an enforcement posture.
+
+---
+
+### B60: ancestry FORK/EXEC dereference `executable` without a NULL check
+**Severity:** Nit
+**Location:** `08-ancestry/ancestry.c`, NOTIFY_FORK and NOTIFY_EXEC handlers
+
+`copy_str_token(n->path, PATH_BUF, &msg->process->executable->path)` (FORK) and `&target->executable->path` (EXEC) formed the token pointer by dereferencing `executable` before the call. `copy_str_token` already NULL-checks the token, but the `executable` deref happened first — a NULL `executable` would crash. ES populates `executable` for FORK/EXEC in practice (so this is defensive, not a confirmed crash), but the BTM handlers in ch10/ch16 already NULL-check `instigator`, and the project's posture is to not leave such derefs load-bearing.
+
+**Fix:** Added a `copy_exec_path(buf, bufsz, proc)` helper that guards `proc && proc->executable` before copying (and writes an empty string otherwise). Both call sites now route through it. The `print_path(target->executable)` call on the EXEC log line was already NULL-safe (`print_path` NULL-checks its argument).

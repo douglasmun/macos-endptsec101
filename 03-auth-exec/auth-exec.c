@@ -97,6 +97,15 @@ static const char *leaf_name(const es_string_token_t *path)
 static int should_deny(const es_process_t *target)
 {
     const es_string_token_t *path = &target->executable->path;
+
+    /*
+     * A truncated path has lost its trailing bytes — the leaf name we match on.
+     * The deny-list compare would fail silently (fail-open). On an AUTH
+     * enforcement path, treat an unmatchable path as deny-worthy (fail-closed).
+     */
+    if (target->executable->path_truncated)
+        return 1;
+
     const char *name = leaf_name(path);
 
     /*

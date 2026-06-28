@@ -156,6 +156,17 @@ static void copy_str_token(char *buf, size_t bufsz, const es_string_token_t *s)
     buf[n] = '\0';
 }
 
+/* Copy a process's executable path, tolerating a NULL executable pointer.
+ * ES populates executable for FORK/EXEC in practice, but guarding keeps the
+ * derefs at the call sites from being load-bearing. */
+static void copy_exec_path(char *buf, size_t bufsz, const es_process_t *proc)
+{
+    if (proc && proc->executable)
+        copy_str_token(buf, bufsz, &proc->executable->path);
+    else
+        buf[0] = '\0';
+}
+
 static void print_str(const es_string_token_t *s)
 {
     if (s && s->data && s->length > 0)
@@ -329,7 +340,7 @@ static void handle_event(es_client_t *client __attribute__((unused)),
         n->parent_token = msg->process->audit_token;
         /* Path is not yet known for the child — it inherits the parent image
          * until EXEC replaces it. Copy parent path as a placeholder. */
-        copy_str_token(n->path, PATH_BUF, &msg->process->executable->path);
+        copy_exec_path(n->path, PATH_BUF, msg->process);
         break;
     }
 
@@ -350,7 +361,13 @@ static void handle_event(es_client_t *client __attribute__((unused)),
         tree_node_t *old = tree_find(&msg->process->audit_token);
 
         tree_node_t *n = tree_get_or_create(&target->audit_token, pid);
-        if (!n) break;
+        if (!n) {
+            /* OOM: still remove the stale pre-exec node. NOTIFY_EXIT only
+             * delivers the post-exec token, so an unremoved pre-exec entry
+             * leaks permanently and its stale parent_token pollutes later walks. */
+            if (old) tree_remove(&msg->process->audit_token);
+            break;
+        }
 
         if (old && old != n) {
             /* Normal exec migration: carry parent link forward, free stale entry.
@@ -363,7 +380,7 @@ static void handle_event(es_client_t *client __attribute__((unused)),
             n->parent_token = target->parent_audit_token;
         }
 
-        copy_str_token(n->path, PATH_BUF, &target->executable->path);
+        copy_exec_path(n->path, PATH_BUF, target);
 
         /* Build and print the ancestry chain */
         char chain[ANCESTRY_STR_MAX];
